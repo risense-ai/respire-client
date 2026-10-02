@@ -1,32 +1,43 @@
-# Manual desktop release workflow.
-# Sidecar CLI is downloaded from the CLI or release repository.
+# Manual desktop validation; publication requires an explicit input.
+# Consume release-mode CLI artifacts from one successful, SHA-verified validation run.
 name: Release
 
 on:
   workflow_dispatch:
     inputs:
       ref:
-        description: git ref to publish
+        description: Client git ref to validate (a version tag is required only for publication)
         default: main
         type: string
-      cli_tag:
-        description: CLI release tag for sidecar (default v{cliMinVersion})
-        default: ""
+      cli_run_id:
+        description: Successful respire-cli Release validation workflow run ID
+        required: true
         type: string
+      cli_sha:
+        description: Exact 40-character CLI source commit recorded in its artifacts
+        required: true
+        type: string
+      publish:
+        description: Publish installers to respire-releases (requires its write token)
+        default: false
+        type: boolean
 
 permissions:
-  contents: write
+  contents: read
+  actions: read
 
 jobs:
   release:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
-      cli_tag: ${{ steps.ver.outputs.cli_tag }}
+      client_sha: ${{ steps.source.outputs.sha }}
     steps:
       - id: meta
+        env:
+          CLIENT_REF: ${{ inputs.ref || github.ref_name }}
         run: |
-          TAG="${{ github.event.inputs.ref || github.ref_name }}"
+          TAG="$CLIENT_REF"
           TAG="${TAG#refs/tags/}"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v5
@@ -34,7 +45,22 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
           ref: ${{ steps.meta.outputs.tag }}
+      - name: Resolve the exact client revision
+        id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Require a completed release-mode CLI validation run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLI_RUN_ID: ${{ inputs.cli_run_id }}
+          CLI_SHA: ${{ inputs.cli_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$CLI_RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::invalid CLI run ID"; exit 1; }
+          [[ "$CLI_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::CLI SHA must be an exact lowercase commit"; exit 1; }
+          gh api "repos/risense-ai/respire-cli/actions/runs/$CLI_RUN_ID" > cli-run.json
+          jq -e '.status == "completed" and .conclusion == "success" and .path == ".github/workflows/release-validation.yml"' cli-run.json > /dev/null
       - name: tag must be on main
+        if: inputs.publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -45,7 +71,7 @@ jobs:
             exit 1
           fi
       - name: tag matches tauri version
-        id: ver
+        if: inputs.publish
         run: |
           VER="$(node -e "const j=require('./client/src-tauri/tauri.conf.json'); process.stdout.write(j.version)")"
           TAG="${{ steps.meta.outputs.tag }}"
@@ -54,12 +80,8 @@ jobs:
             v*) echo "::error::tag $TAG != tauri.conf.json $VER"; exit 1 ;;
             *) echo "::error::pass a v* tag (v$VER)"; exit 1 ;;
           esac
-          CLI="${{ github.event.inputs.cli_tag }}"
-          if [ -z "$CLI" ]; then
-            CLI="$(node -e "const m=require('./contracts/compatibility-matrix.json'); process.stdout.write('v'+m.cliMinVersion)")"
-          fi
-          echo "cli_tag=$CLI" >> "$GITHUB_OUTPUT"
       - name: Ensure release exists
+        if: inputs.publish
         env:
           DST_TOKEN: ${{ secrets.RELEASES_GITHUB_TOKEN }}
         run: |
@@ -79,7 +101,6 @@ jobs:
     name: client (${{ matrix.name }})
     needs: release
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.optional == true }}
     defaults:
       run:
         shell: bash
@@ -116,15 +137,14 @@ jobs:
             target: aarch64-pc-windows-msvc
             bundles: nsis
             asset: respire-windows-arm64-setup.exe
-            optional: true
             rustflags: "-C target-feature=-crt-static"
             cflags: "/MD"
     steps:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
-          ref: ${{ github.event.inputs.ref || github.ref }}
-      - uses: dtolnay/rust-toolchain@stable
+          ref: ${{ needs.release.outputs.client_sha }}
+      - uses: dtolnay/rust-toolchain@1.95.0
         with:
           targets: ${{ matrix.target }}
       - uses: actions/setup-node@v4
@@ -137,30 +157,19 @@ jobs:
         run: |
           npm ci
           npm run build
-      - name: Download CLI sidecar
+      - name: Download the verified release-mode CLI sidecar
         env:
-          GH_TOKEN: ${{ secrets.CLI_REPO_TOKEN || github.token }}
-          DST_TOKEN: ${{ secrets.RELEASES_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          CLI_RUN_ID: ${{ inputs.cli_run_id }}
+          CLI_SHA: ${{ inputs.cli_sha }}
         run: |
           set -euo pipefail
-          TAG="${{ needs.release.outputs.cli_tag }}"
           T="${{ matrix.target }}"
           CLI_TARGET="$(node -e "const m=require('./contracts/compatibility-matrix.json'); process.stdout.write(m.cliArtifactTargets[process.argv[1]]);" "$T")"
-          EXT=""
-          case "$CLI_TARGET" in *windows*) EXT=".exe" ;; esac
-          BIN="rsrs-${CLI_TARGET}${EXT}"
-          RUNTIME="rsrs-${CLI_TARGET}-runtime.tar.gz"
-          mkdir -p cli-artifact
-          download() {
-            if [ -n "${DST_TOKEN:-}" ] && GH_TOKEN="$DST_TOKEN" gh release download "$TAG" --repo risense-ai/respire-releases --pattern "$1" --dir cli-artifact; then
-              return 0
-            fi
-            GH_TOKEN="$GH_TOKEN" gh release download "$TAG" --repo risense-ai/respire-cli --pattern "$1" --dir cli-artifact
-          }
-          download "$BIN"
-          download "$RUNTIME"
-          tar -xzf "cli-artifact/$RUNTIME" -C cli-artifact
-          cp "cli-artifact/$BIN" "cli-artifact/rsrs${EXT}"
+          gh run download "$CLI_RUN_ID" --repo risense-ai/respire-cli \
+            --name "cli-release-${CLI_TARGET}" --dir cli-artifact
+          node build/verify-cli-artifact.mjs cli-artifact "$CLI_TARGET" "$CLI_SHA"
+          tar -xzf "cli-artifact/rsrs-${CLI_TARGET}-runtime.tar.gz" -C cli-artifact
       - name: Fetch BGE model
         run: |
           set -euo pipefail
@@ -190,16 +199,15 @@ jobs:
           CXXFLAGS: ${{ matrix.cflags }}
           TARGET_CFLAGS: ${{ matrix.cflags }}
           TARGET_CXXFLAGS: ${{ matrix.cflags }}
-      - name: Upload to respire-releases
+      - name: Collect installers and source identities
         env:
-          DST_TOKEN: ${{ secrets.RELEASES_GITHUB_TOKEN }}
+          CLI_SHA: ${{ inputs.cli_sha }}
         run: |
           set -euo pipefail
-          TAG="${{ needs.release.outputs.tag }}"
           T="${{ matrix.target }}"
           mkdir -p dist
           shopt -s nullglob
-          upload() {
+          collect() {
             local dest="$1"
             shift
             [ -n "$dest" ] || return 0
@@ -211,17 +219,32 @@ jobs:
             done
             [ -n "$src" ] || { echo "::error::missing $dest"; exit 1; }
             cp "$src" "dist/$dest"
-            GH_TOKEN="$DST_TOKEN" gh release upload "$TAG" "dist/$dest" --repo risense-ai/respire-releases --clobber
           }
           ROOT="client/src-tauri/target"
-          upload "${{ matrix.asset }}" \
+          collect "${{ matrix.asset }}" \
             "$ROOT/$T/release/bundle/deb/"*.deb \
             "$ROOT/$T/release/bundle/dmg/"*.dmg \
-            "$ROOT/$T/release/bundle/macos/"*.dmg \
-            "$ROOT/$T/release/bundle/nsis/"*.exe \
-            "$ROOT/release/bundle/deb/"*.deb \
-            "$ROOT/release/bundle/dmg/"*.dmg \
-            "$ROOT/release/bundle/nsis/"*.exe
-          upload "${{ matrix.rpm_asset }}" \
-            "$ROOT/$T/release/bundle/rpm/"*.rpm \
-            "$ROOT/release/bundle/rpm/"*.rpm
+            "$ROOT/$T/release/bundle/nsis/"*.exe
+          collect "${{ matrix.rpm_asset }}" "$ROOT/$T/release/bundle/rpm/"*.rpm
+          git rev-parse HEAD > dist/client-sha.txt
+          printf '%s\n' "$CLI_SHA" > dist/cli-sha.txt
+          cp cli-artifact/cli-build-*.json dist/
+          (cd dist && sha256sum * > SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.name }}-${{ needs.release.outputs.client_sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload to respire-releases
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_GITHUB_TOKEN }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" "dist/${{ matrix.asset }}" --repo risense-ai/respire-releases --clobber
+          RPM="${{ matrix.rpm_asset }}"
+          if [ -n "$RPM" ]; then
+            gh release upload "$TAG" "dist/$RPM" --repo risense-ai/respire-releases --clobber
+          fi

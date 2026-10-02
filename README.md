@@ -66,4 +66,12 @@ The existing `ONEMEMORY_*` environment names and command identifiers are compati
 
 The existing frontend tests cover typography preferences, body rendering, tree filtering, and access scopes. Native packaging requires its target platform and the matching CLI artifact. A local Windows check does not verify macOS or Linux installers.
 
-Release version tags must match `tauri.conf.json`; pushing a tag does not publish automatically. The release workflow consumes versioned CLI artifacts and can publish desktop installers to the release repository only when manually dispatched. Running a release or publishing a package is a separate operation from editing this repository.
+The manual `Release` workflow defaults to `publish=false`. Supply a successful `respire-cli` Release validation run ID and its exact 40-character source SHA. All five desktop targets consume that run's release-mode CLI artifacts, verify their source identities and hashes, build native installers, and upload installers and checksums as Actions artifacts. This validation does not create a GitHub Release or deploy a service.
+
+```sh
+gh workflow run release.yml --repo risense-ai/respire-client \
+  -f ref=main -f cli_run_id=<successful-run-id> -f cli_sha=<exact-cli-sha> \
+  -f publish=false
+```
+
+Publication is a separate manual choice: `publish=true` also requires a version tag matching `tauri.conf.json` and a `RELEASES_GITHUB_TOKEN` with write access to the release repository. macOS signing/notarization and Windows signing are not configured; successful package construction does not establish those distribution guarantees. Bundled CLI runtime files are resolved through Tauri's platform resource directory when installing the CLI into the user PATH.

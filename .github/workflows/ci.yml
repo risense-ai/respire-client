@@ -22,6 +22,7 @@ jobs:
           bash -n build/stage-desktop-bundle.sh
           bash -n client/src-tauri/binaries/sync-cli-bin.sh
           node --check client/src-tauri/binaries/sync-cli-bin.mjs
+          node --check build/verify-cli-artifact.mjs
   tree-ui:
     runs-on: ubuntu-latest
     defaults:

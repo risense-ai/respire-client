@@ -774,7 +774,8 @@ async fn rerank_model_install(app: tauri::AppHandle, source: Option<String>, mir
 }
 
 #[tauri::command]
-async fn cli_install() -> Result<serde_json::Value, String> {
+async fn cli_install(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    use tauri::Manager;
     let which = if cfg!(windows) { "where" } else { "which" };
     let found = hidden_command(which)
         .arg("rsrs")
@@ -786,7 +787,9 @@ async fn cli_install() -> Result<serde_json::Value, String> {
     }
     // Install the bundled CLI into the user's PATH directory when available.
     if let Some(src) = bundled_cli() {
-        install_cli_to_path(&src)?;
+        let resources = app.path().resource_dir()
+            .map_err(|e| format!("无法定位包内 CLI 运行库目录: {e}"))?;
+        install_cli_to_path(&src, &resources)?;
         return Ok(serde_json::json!({ "installed": true, "action": "installed" }));
     }
     // Use npm when no CLI is bundled.
@@ -857,12 +860,11 @@ fn sidecar_triple() -> String {
 }
 
 /// Copy the bundled CLI to the user's bin directory and update PATH when required.
-fn install_cli_to_path(src: &PathBuf) -> Result<(), String> {
+fn install_cli_to_path(src: &PathBuf, source_dir: &PathBuf) -> Result<(), String> {
     let home = std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
         .map_err(|_| "无法确定用户目录".to_owned())?;
     let bin_dir = PathBuf::from(&home).join(if cfg!(windows) { "bin" } else { ".local/bin" });
     // Copy only the runtime files declared by the trusted bundled manifest.
-    let source_dir = src.parent().ok_or("无法定位包内 CLI 目录")?;
     let manifest_path = source_dir.join("core-runtime.json");
     let manifest_text = std::fs::read_to_string(&manifest_path)
         .map_err(|e| format!("无法读取包内 CLI 运行库清单 {}: {e}", manifest_path.display()))?;
