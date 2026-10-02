@@ -1,0 +1,39 @@
+name: Client CI
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Parse compatibility matrix
+        run: node -e "const m=JSON.parse(require('fs').readFileSync('contracts/compatibility-matrix.json','utf8')); if (m.schemaVersion !== 1) process.exit(1);"
+      - name: Sidecar script syntax
+        run: |
+          bash -n build/stage-desktop-bundle.sh
+          bash -n client/src-tauri/binaries/sync-cli-bin.sh
+          node --check client/src-tauri/binaries/sync-cli-bin.mjs
+  tree-ui:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client/tree-ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/tree-ui/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run build

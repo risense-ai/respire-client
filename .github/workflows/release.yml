@@ -1,0 +1,227 @@
+# Manual desktop release workflow.
+# Sidecar CLI is downloaded from the CLI or release repository.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: git ref to publish
+        default: main
+        type: string
+      cli_tag:
+        description: CLI release tag for sidecar (default v{cliMinVersion})
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      cli_tag: ${{ steps.ver.outputs.cli_tag }}
+    steps:
+      - id: meta
+        run: |
+          TAG="${{ github.event.inputs.ref || github.ref_name }}"
+          TAG="${TAG#refs/tags/}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ steps.meta.outputs.tag }}
+      - name: tag must be on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::v* must be an ancestor of origin/main"
+            exit 1
+          fi
+      - name: tag matches tauri version
+        id: ver
+        run: |
+          VER="$(node -e "const j=require('./client/src-tauri/tauri.conf.json'); process.stdout.write(j.version)")"
+          TAG="${{ steps.meta.outputs.tag }}"
+          case "$TAG" in
+            "v$VER") ;;
+            v*) echo "::error::tag $TAG != tauri.conf.json $VER"; exit 1 ;;
+            *) echo "::error::pass a v* tag (v$VER)"; exit 1 ;;
+          esac
+          CLI="${{ github.event.inputs.cli_tag }}"
+          if [ -z "$CLI" ]; then
+            CLI="$(node -e "const m=require('./contracts/compatibility-matrix.json'); process.stdout.write('v'+m.cliMinVersion)")"
+          fi
+          echo "cli_tag=$CLI" >> "$GITHUB_OUTPUT"
+      - name: Ensure release exists
+        env:
+          DST_TOKEN: ${{ secrets.RELEASES_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DST_TOKEN:-}" ]; then
+            echo "::error::secrets.RELEASES_GITHUB_TOKEN missing (contents:write on risense-ai/respire-releases)"
+            exit 1
+          fi
+          TAG="${{ steps.meta.outputs.tag }}"
+          if GH_TOKEN="$DST_TOKEN" gh release view "$TAG" --repo risense-ai/respire-releases >/dev/null 2>&1; then
+            echo "release $TAG exists"
+          else
+            GH_TOKEN="$DST_TOKEN" gh release create "$TAG" --repo risense-ai/respire-releases --title "$TAG" --notes "respire desktop ${TAG}"
+          fi
+
+  client:
+    name: client (${{ matrix.name }})
+    needs: release
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.optional == true }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bundles: deb,rpm
+            asset: respire-linux-x64.deb
+            rpm_asset: respire-linux-x64.rpm
+          - name: linux-arm64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            bundles: deb,rpm
+            asset: respire-linux-arm64.deb
+            rpm_asset: respire-linux-arm64.rpm
+          - name: mac-arm64-dmg
+            os: macos-latest
+            target: aarch64-apple-darwin
+            bundles: dmg
+            asset: respire-macos-arm64.dmg
+          - name: windows-x64-nsis
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+            asset: respire-windows-x64-setup.exe
+            rustflags: "-C target-feature=-crt-static"
+            cflags: "/MD"
+          - name: windows-arm64-nsis
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            bundles: nsis
+            asset: respire-windows-arm64-setup.exe
+            optional: true
+            rustflags: "-C target-feature=-crt-static"
+            cflags: "/MD"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.inputs.ref || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: client/tree-ui/package-lock.json
+      - name: Build tree-ui
+        working-directory: client/tree-ui
+        run: |
+          npm ci
+          npm run build
+      - name: Download CLI sidecar
+        env:
+          GH_TOKEN: ${{ secrets.CLI_REPO_TOKEN || github.token }}
+          DST_TOKEN: ${{ secrets.RELEASES_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.release.outputs.cli_tag }}"
+          T="${{ matrix.target }}"
+          CLI_TARGET="$(node -e "const m=require('./contracts/compatibility-matrix.json'); process.stdout.write(m.cliArtifactTargets[process.argv[1]]);" "$T")"
+          EXT=""
+          case "$CLI_TARGET" in *windows*) EXT=".exe" ;; esac
+          BIN="rsrs-${CLI_TARGET}${EXT}"
+          RUNTIME="rsrs-${CLI_TARGET}-runtime.tar.gz"
+          mkdir -p cli-artifact
+          download() {
+            if [ -n "${DST_TOKEN:-}" ] && GH_TOKEN="$DST_TOKEN" gh release download "$TAG" --repo risense-ai/respire-releases --pattern "$1" --dir cli-artifact; then
+              return 0
+            fi
+            GH_TOKEN="$GH_TOKEN" gh release download "$TAG" --repo risense-ai/respire-cli --pattern "$1" --dir cli-artifact
+          }
+          download "$BIN"
+          download "$RUNTIME"
+          tar -xzf "cli-artifact/$RUNTIME" -C cli-artifact
+          cp "cli-artifact/$BIN" "cli-artifact/rsrs${EXT}"
+      - name: Fetch BGE model
+        run: |
+          set -euo pipefail
+          mkdir -p models/bge-base-zh-v1.5/onnx
+          REV=71e50dc531959f9e04ebf190ea25b00261a0a186
+          B="https://hf-mirror.com/Xenova/bge-base-zh-v1.5/resolve/${REV}"
+          dl() { curl -fsSL --retry 3 --retry-delay 5 -o "$2" "$1"; }
+          dl "$B/tokenizer.json" models/bge-base-zh-v1.5/tokenizer.json
+          dl "$B/onnx/model.onnx" models/bge-base-zh-v1.5/onnx/model.onnx
+          cp cli-artifact/core-notices/models/FlagEmbedding-LICENSE.txt models/bge-base-zh-v1.5/LICENSE.txt
+          cp cli-artifact/core-notices/models/bge-base-zh-v1.5-MODEL-CARD.md models/bge-base-zh-v1.5/MODEL-CARD.md
+          cp cli-artifact/core-notices/models/sources.json models/bge-base-zh-v1.5/sources.json
+          bash build/stage-desktop-bundle.sh verify-model
+      - name: Stage sidecar
+        run: bash build/stage-desktop-bundle.sh stage-sidecar cli-artifact "${{ matrix.target }}"
+      - name: Linux bundle deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libgtk-3-dev rpm
+      - name: Tauri build
+        working-directory: client/src-tauri
+        run: npx -y @tauri-apps/cli@2 build --config tauri.core-runtime.conf.json --bundles ${{ matrix.bundles }} --target ${{ matrix.target }}
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+          CFLAGS: ${{ matrix.cflags }}
+          CXXFLAGS: ${{ matrix.cflags }}
+          TARGET_CFLAGS: ${{ matrix.cflags }}
+          TARGET_CXXFLAGS: ${{ matrix.cflags }}
+      - name: Upload to respire-releases
+        env:
+          DST_TOKEN: ${{ secrets.RELEASES_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.release.outputs.tag }}"
+          T="${{ matrix.target }}"
+          mkdir -p dist
+          shopt -s nullglob
+          upload() {
+            local dest="$1"
+            shift
+            [ -n "$dest" ] || return 0
+            local src="" f
+            for f in "$@"; do
+              [ -f "$f" ] || continue
+              src="$f"
+              break
+            done
+            [ -n "$src" ] || { echo "::error::missing $dest"; exit 1; }
+            cp "$src" "dist/$dest"
+            GH_TOKEN="$DST_TOKEN" gh release upload "$TAG" "dist/$dest" --repo risense-ai/respire-releases --clobber
+          }
+          ROOT="client/src-tauri/target"
+          upload "${{ matrix.asset }}" \
+            "$ROOT/$T/release/bundle/deb/"*.deb \
+            "$ROOT/$T/release/bundle/dmg/"*.dmg \
+            "$ROOT/$T/release/bundle/macos/"*.dmg \
+            "$ROOT/$T/release/bundle/nsis/"*.exe \
+            "$ROOT/release/bundle/deb/"*.deb \
+            "$ROOT/release/bundle/dmg/"*.dmg \
+            "$ROOT/release/bundle/nsis/"*.exe
+          upload "${{ matrix.rpm_asset }}" \
+            "$ROOT/$T/release/bundle/rpm/"*.rpm \
+            "$ROOT/release/bundle/rpm/"*.rpm

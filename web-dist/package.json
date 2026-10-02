@@ -1,0 +1,7 @@
+{
+  "name": "@rsrsai/web-dist",
+  "version": "1.0.0",
+  "private": true,
+  "description": "respire Web client static assets",
+  "files": ["dist"]
+}

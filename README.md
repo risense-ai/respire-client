@@ -1,0 +1,69 @@
+# Respire Client
+
+Frontend and desktop shell for Respire. The client invokes a versioned CLI for memory operations; it does not compile or contain the Core implementation.
+
+```mermaid
+flowchart LR
+  UI[Tree UI] --> Shell[Tauri shell or web bridge]
+  Shell --> CLI[Respire CLI]
+  CLI --> Core[Core binary]
+  CLI --> Sync[Sync API]
+```
+
+## Repository map
+
+| Path | Responsibility |
+| --- | --- |
+| `client/tree-ui/` | React tree, diary, settings, and memory views |
+| `client/src-tauri/` | Native commands, dialogs, and CLI subprocess bridge |
+| `client/ui/` | Vanilla JavaScript interface |
+| `web-dist/` | Static frontend layout consumed by `rsrs web` |
+| `contracts/compatibility-matrix.json` | CLI version and desktop artifact mapping |
+| `build/` | Model verification and sidecar staging |
+
+## Development
+
+Use Node.js 20.19+ or 22.12+ for the frontend. Native builds also need Rust and the platform dependencies required by Tauri 2.
+
+```sh
+cd client/tree-ui
+npm ci
+npm test
+npm run build
+```
+
+The frontend build produces `dist/index.html`. See [tree-ui](client/tree-ui/README.md) for its component map.
+
+## Desktop sidecar
+
+Obtain a matching CLI binary and its `rsrs-<CLI-target>-runtime.tar.gz` companion from the same release. Extract them into one directory and name the executable `rsrs` or `rsrs.exe` before staging.
+
+```sh
+# Run from the repository root.
+node client/src-tauri/binaries/sync-cli-bin.mjs <CLI-binary-directory> [desktop-target]
+cd client/src-tauri
+npx @tauri-apps/cli@2 build --config tauri.core-runtime.conf.json
+```
+
+The desktop installer copies the unique `rsrs` executable together with every DLL and license file declared in the bundled `core-runtime.json`. Missing manifests or runtime files fail installation explicitly. Staging validates runtime checksums and generates a Tauri resource configuration for native libraries and notices. The compatibility matrix maps Linux desktop targets to their musl CLI artifacts. The release workflow also verifies the bundled legacy BGE model and includes its license. Model files, CLI binaries, and generated runtime resources are not source files and must stay out of Git.
+
+## Component boundaries
+
+| Component | Client interaction |
+| --- | --- |
+| [CLI](https://github.com/risense-ai/respire-cli) | Versioned executable; existing JSON command contract |
+| [Server](https://github.com/risense-ai/respire-server) | Synchronization through the CLI |
+| Core | No direct source or Rust dependency; consumed by the CLI as a binary |
+| [Documentation](https://github.com/risense-ai/respire-docs) | Canonical compatibility contracts and architecture |
+
+The only CLI command is `rsrs`; install it with `npm i -g @rsrsai/cli` or `pnpm add -g @rsrsai/cli`. The desktop application ID is `ai.risense.respire`. Previous desktop application data directories are not migrated automatically. The default synchronization endpoint is `https://api.rsrs.rs`; configure the actual server address for a deployment.
+
+New configuration and account data default to `~/.respire`; the client does not implicitly load previous application configuration. The CLI local runtime defaults to `127.0.0.1:15169`. Site: `https://rsrs.rs`; user dashboard: `https://dash.rsrs.rs`; administrator dashboard: `https://admin.rsrs.rs`; API: `https://api.rsrs.rs`. These are configuration values, not a deployment confirmation.
+
+The existing `ONEMEMORY_*` environment names and command identifiers are compatibility interfaces. Chinese UI text and sample data are preserved.
+
+## Validation and releases
+
+The existing frontend tests cover typography preferences, body rendering, tree filtering, and access scopes. Native packaging requires its target platform and the matching CLI artifact. A local Windows check does not verify macOS or Linux installers.
+
+Release version tags must match `tauri.conf.json`; pushing a tag does not publish automatically. The release workflow consumes versioned CLI artifacts and can publish desktop installers to the release repository only when manually dispatched. Running a release or publishing a package is a separate operation from editing this repository.

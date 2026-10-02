@@ -1,0 +1,30 @@
+{
+  "schemaVersion": 1,
+  "clientRepo": "risense-ai/respire-client",
+  "cliRepo": "risense-ai/respire-cli",
+  "cliPackage": "@rsrsai/cli",
+  "cliMinVersion": "1.0.0",
+  "coreConsumption": "none-direct",
+  "sidecar": {
+    "stageScript": "client/src-tauri/binaries/sync-cli-bin.mjs",
+    "destDir": "client/src-tauri/binaries",
+    "fileName": "rsrs-${target}",
+    "windowsExt": ".exe",
+    "unixAlias": "rsrs",
+    "runtimeManifest": "core-runtime.json"
+  },
+  "supportedTargets": [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc"
+  ],
+  "cliArtifactTargets": {
+    "x86_64-unknown-linux-gnu": "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-gnu": "aarch64-unknown-linux-musl",
+    "aarch64-apple-darwin": "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc": "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc": "aarch64-pc-windows-msvc"
+  }
+}
