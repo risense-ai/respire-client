@@ -57,6 +57,9 @@
         "postInstallScript": "scripts/postinst.sh"
       },
       "rpm": {
+        "compression": {
+          "type": "none"
+        },
         "files": {
           "/usr/bin/rsrs": "binaries/rsrs",
           "/usr/share/fonts/truetype/lxgw/LXGWMarkerGothic-Regular.ttf": "fonts/LXGWMarkerGothic-Regular.ttf",

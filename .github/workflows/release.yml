@@ -274,14 +274,24 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libgtk-3-dev rpm
       - name: Tauri build
+        timeout-minutes: 30
         working-directory: client/src-tauri
-        run: npx -y @tauri-apps/cli@2 build --config tauri.core-runtime.conf.json --bundles ${{ matrix.bundles }} --target ${{ matrix.target }}
+        run: |
+          npx -y @tauri-apps/cli@2.12.1 --version
+          npx -y @tauri-apps/cli@2.12.1 build --config tauri.core-runtime.conf.json --bundles ${{ matrix.bundles }} --target ${{ matrix.target }}
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
           CFLAGS: ${{ matrix.cflags }}
           CXXFLAGS: ${{ matrix.cflags }}
           TARGET_CFLAGS: ${{ matrix.cflags }}
           TARGET_CXXFLAGS: ${{ matrix.cflags }}
+      - name: Verify Linux RPM digests
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          for package in client/src-tauri/target/${{ matrix.target }}/release/bundle/rpm/*.rpm; do
+            rpm --checksig --nosignature "$package"
+          done
       - name: Collect installers and source identities
         env:
           CLI_SHA: ${{ needs.release.outputs.cli_sha || inputs.cli_sha }}
