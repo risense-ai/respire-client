@@ -66,7 +66,9 @@ The existing `ONEMEMORY_*` environment names and command identifiers are compati
 
 The existing frontend tests cover typography preferences, body rendering, tree filtering, and access scopes. Native packaging requires its target platform and the matching CLI artifact. A local Windows check does not verify macOS or Linux installers.
 
-The manual `Release` workflow defaults to `publish=false`. Supply a successful `respire-cli` Release validation run ID and its exact 40-character source SHA. All five desktop targets consume that run's release-mode CLI artifacts, verify their source identities and hashes, build native installers, and upload installers and checksums as Actions artifacts. This validation does not create a GitHub Release or deploy a service.
+Pushing `main` builds all five desktop targets and publishes a development prerelease in this repository after all targets pass. Its version is `<source-version>-dev.<run-id>`; version files are changed only inside the build. Pushing a stable `v<source-version>` tag publishes a stable release. Automatic builds consume one complete published CLI release, verify its source identities and hashes, and record the selected CLI version and commit. Development builds record CLI `main` at the start and wait up to 20 minutes for its complete published assets; they fail explicitly at the limit instead of consuming an older build.
+
+The manual `Release` workflow still defaults to `publish=false`. Supply a successful `respire-cli` Release validation run ID and its exact 40-character source SHA. This mode builds native installers and retains checksummed Actions artifacts without creating a GitHub Release or deploying a service.
 
 ```sh
 gh workflow run release.yml --repo risense-ai/respire-client \
@@ -74,4 +76,4 @@ gh workflow run release.yml --repo risense-ai/respire-client \
   -f publish=false
 ```
 
-Publication is a separate manual choice: `publish=true` also requires a version tag matching `tauri.conf.json` and a `RELEASES_GITHUB_TOKEN` with write access to the release repository. macOS signing/notarization and Windows signing are not configured; successful package construction does not establish those distribution guarantees. Bundled CLI runtime files are resolved through Tauri's platform resource directory when installing the CLI into the user PATH.
+Manual `publish=true` requires a version tag matching `tauri.conf.json` and publishes to this repository with its Actions token. Mirroring to `respire-releases` separately requires `RELEASES_GITHUB_TOKEN`; an unconfigured mirror reports that status and the working download URL explicitly. macOS signing/notarization and Windows signing are not configured; successful package construction does not establish those distribution guarantees. Bundled CLI runtime files are resolved through Tauri's platform resource directory when installing the CLI into the user PATH.

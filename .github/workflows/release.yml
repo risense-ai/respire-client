@@ -1,8 +1,12 @@
-# Manual desktop validation; publication requires an explicit input.
+# main publishes development builds; version tags publish stable builds.
+# Manual validation remains non-publishing by default.
 # Consume release-mode CLI artifacts from one successful, SHA-verified validation run.
 name: Release
 
 on:
+  push:
+    branches: [main]
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       ref:
@@ -18,7 +22,7 @@ on:
         required: true
         type: string
       publish:
-        description: Publish installers to respire-releases (requires its write token)
+        description: Publish installers to this repository after manual validation
         default: false
         type: boolean
 
@@ -29,26 +33,53 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
       client_sha: ${{ steps.source.outputs.sha }}
+      version: ${{ steps.meta.outputs.version }}
+      channel: ${{ steps.meta.outputs.channel }}
+      cli_tag: ${{ steps.cli.outputs.tag }}
+      cli_sha: ${{ steps.cli.outputs.sha }}
     steps:
-      - id: meta
-        env:
-          CLIENT_REF: ${{ inputs.ref || github.ref_name }}
-        run: |
-          TAG="$CLIENT_REF"
-          TAG="${TAG#refs/tags/}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ steps.meta.outputs.tag }}
+          ref: ${{ inputs.ref || github.ref }}
+      - id: meta
+        env:
+          CLIENT_REF: ${{ inputs.ref || github.ref_name }}
+        run: |
+          set -euo pipefail
+          BASE="$(node -p "require('./client/src-tauri/tauri.conf.json').version")"
+          TAG="${CLIENT_REF#refs/tags/}"
+          CHANNEL=manual
+          VERSION="$BASE"
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            if [ "$GITHUB_REF_TYPE" = branch ]; then
+              CHANNEL=dev
+              VERSION="${BASE}-dev.${GITHUB_RUN_ID}"
+              TAG="v${VERSION}"
+            else
+              CHANNEL=stable
+              test "$TAG" = "v$BASE" || { echo "::error::tag must match the client source version v$BASE"; exit 1; }
+            fi
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
       - name: Resolve the exact client revision
         id: source
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Require stable release sources to belong to main
+        if: steps.meta.outputs.channel == 'stable' || inputs.publish
+        run: |
+          set -euo pipefail
+          git fetch origin main:refs/remotes/origin/main
+          git merge-base --is-ancestor HEAD origin/main
       - name: Require a completed release-mode CLI validation run
+        if: github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
           CLI_RUN_ID: ${{ inputs.cli_run_id }}
@@ -59,43 +90,74 @@ jobs:
           [[ "$CLI_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::CLI SHA must be an exact lowercase commit"; exit 1; }
           gh api "repos/risense-ai/respire-cli/actions/runs/$CLI_RUN_ID" > cli-run.json
           jq -e '.status == "completed" and .conclusion == "success" and .path == ".github/workflows/release-validation.yml"' cli-run.json > /dev/null
-      - name: tag must be on main
-        if: inputs.publish
+      - name: Resolve one complete published CLI release
+        id: cli
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ steps.meta.outputs.channel }}
         run: |
           set -euo pipefail
-          git fetch "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" main:refs/remotes/origin/main
-          if ! git merge-base --is-ancestor HEAD origin/main; then
-            echo "::error::v* must be an ancestor of origin/main"
+          ATTEMPTS=1
+          EXPECTED_SHA=""
+          if [ "$CHANNEL" = dev ]; then
+            ATTEMPTS=40
+            EXPECTED_SHA="$(gh api repos/risense-ai/respire-cli/git/ref/heads/main --jq .object.sha)"
+            echo "Waiting up to 20 minutes for complete CLI dev assets at main $EXPECTED_SHA" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+          mkdir cli-identity
+          READY=false
+          for ((ATTEMPT=1; ATTEMPT<=ATTEMPTS; ATTEMPT++)); do
+            gh api 'repos/risense-ai/respire-cli/releases?per_page=50' > cli-releases.json
+            if [ "$CHANNEL" = dev ]; then
+              TAG="$(jq -r '[.[] | select(.draft == false and .prerelease == true and (.tag_name | contains("-dev.")))][0].tag_name // empty' cli-releases.json)"
+            else
+              TAG="$(jq -r '[.[] | select(.draft == false and .prerelease == false and (.tag_name | startswith("v")))][0].tag_name // empty' cli-releases.json)"
+            fi
+            COMPLETE=false
+            if [ -n "$TAG" ]; then
+              gh api "repos/risense-ai/respire-cli/releases/tags/$TAG" > cli-release.json
+              COMPLETE=true
+              while IFS= read -r TARGET; do
+                EXT=""
+                case "$TARGET" in *windows*) EXT=".exe" ;; esac
+                for ASSET in "rsrs-${TARGET}${EXT}" "rsrs-${TARGET}-runtime.tar.gz" "cli-build-${TARGET}.json"; do
+                  if ! jq -e --arg name "$ASSET" 'any(.assets[]; .name == $name and .size > 0)' cli-release.json > /dev/null; then
+                    COMPLETE=false
+                  fi
+                done
+              done < <(node -e "console.log([...new Set(Object.values(require('./contracts/compatibility-matrix.json').cliArtifactTargets))].join('\\n'))")
+            fi
+            if [ "$COMPLETE" = true ]; then
+              gh release download "$TAG" --repo risense-ai/respire-cli --pattern 'cli-build-*.json' --dir cli-identity --clobber
+              SHA="$(node -p "require('./cli-identity/cli-build-x86_64-pc-windows-msvc.json').git_sha")"
+              [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::invalid published CLI source SHA"; exit 1; }
+              node -e "const fs=require('fs');for(const f of fs.readdirSync('cli-identity')){const m=JSON.parse(fs.readFileSync('cli-identity/'+f));if(m.git_sha!==process.argv[1])throw Error('CLI release mixes source commits');}" "$SHA"
+              if [ "$CHANNEL" != dev ] || [ "$SHA" = "$EXPECTED_SHA" ]; then
+                READY=true
+                break
+              fi
+              echo "Published CLI $TAG is $SHA; waiting for $EXPECTED_SHA ($ATTEMPT/$ATTEMPTS)"
+            else
+              echo "Complete CLI $CHANNEL assets are not published yet ($ATTEMPT/$ATTEMPTS)"
+            fi
+            if [ "$ATTEMPT" -lt "$ATTEMPTS" ]; then sleep 30; fi
+          done
+          if [ "$READY" != true ]; then
+            echo "::error::no complete published CLI $CHANNEL release for $EXPECTED_SHA within the wait limit; finish the CLI publication gate and rerun this workflow"
             exit 1
           fi
-      - name: tag matches tauri version
-        if: inputs.publish
-        run: |
-          VER="$(node -e "const j=require('./client/src-tauri/tauri.conf.json'); process.stdout.write(j.version)")"
-          TAG="${{ steps.meta.outputs.tag }}"
-          case "$TAG" in
-            "v$VER") ;;
-            v*) echo "::error::tag $TAG != tauri.conf.json $VER"; exit 1 ;;
-            *) echo "::error::pass a v* tag (v$VER)"; exit 1 ;;
-          esac
-      - name: Ensure release exists
+          printf 'CLI release: %s; source: %s\n' "$TAG" "$SHA" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+      - name: Validate a manual publication tag
         if: inputs.publish
         env:
-          DST_TOKEN: ${{ secrets.RELEASES_GITHUB_TOKEN }}
+          CLIENT_TAG: ${{ steps.meta.outputs.tag }}
         run: |
-          set -euo pipefail
-          if [ -z "${DST_TOKEN:-}" ]; then
-            echo "::error::secrets.RELEASES_GITHUB_TOKEN missing (contents:write on risense-ai/respire-releases)"
-            exit 1
-          fi
-          TAG="${{ steps.meta.outputs.tag }}"
-          if GH_TOKEN="$DST_TOKEN" gh release view "$TAG" --repo risense-ai/respire-releases >/dev/null 2>&1; then
-            echo "release $TAG exists"
-          else
-            GH_TOKEN="$DST_TOKEN" gh release create "$TAG" --repo risense-ai/respire-releases --title "$TAG" --notes "respire desktop ${TAG}"
-          fi
+          BASE="$(node -p "require('./client/src-tauri/tauri.conf.json').version")"
+          test "$CLIENT_TAG" = "v$BASE" || { echo "::error::manual publication needs the source version tag v$BASE"; exit 1; }
+          git show-ref --verify "refs/tags/$CLIENT_TAG"
 
   client:
     name: client (${{ matrix.name }})
@@ -157,17 +219,38 @@ jobs:
         run: |
           npm ci
           npm run build
-      - name: Download the verified release-mode CLI sidecar
+      - name: Set the development build version without committing it
+        if: needs.release.outputs.channel == 'dev'
+        env:
+          BUILD_VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const configPath = 'client/src-tauri/tauri.conf.json';
+          const config = JSON.parse(fs.readFileSync(configPath));
+          config.version = process.env.BUILD_VERSION;
+          fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n');
+          const cargoPath = 'client/src-tauri/Cargo.toml';
+          const cargo = fs.readFileSync(cargoPath, 'utf8');
+          fs.writeFileSync(cargoPath, cargo.replace(/^version = "[^"]+"/m, 'version = ' + JSON.stringify(process.env.BUILD_VERSION)));
+          NODE
+      - name: Download and verify one pinned CLI sidecar
         env:
           GH_TOKEN: ${{ github.token }}
           CLI_RUN_ID: ${{ inputs.cli_run_id }}
-          CLI_SHA: ${{ inputs.cli_sha }}
+          CLI_SHA: ${{ needs.release.outputs.cli_sha || inputs.cli_sha }}
+          CLI_TAG: ${{ needs.release.outputs.cli_tag }}
         run: |
           set -euo pipefail
           T="${{ matrix.target }}"
           CLI_TARGET="$(node -e "const m=require('./contracts/compatibility-matrix.json'); process.stdout.write(m.cliArtifactTargets[process.argv[1]]);" "$T")"
-          gh run download "$CLI_RUN_ID" --repo risense-ai/respire-cli \
-            --name "cli-release-${CLI_TARGET}" --dir cli-artifact
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            gh run download "$CLI_RUN_ID" --repo risense-ai/respire-cli \
+              --name "cli-release-${CLI_TARGET}" --dir cli-artifact
+          else
+            gh release download "$CLI_TAG" --repo risense-ai/respire-cli --dir cli-artifact \
+              --pattern "rsrs-${CLI_TARGET}*" --pattern "cli-build-${CLI_TARGET}.json"
+          fi
           node build/verify-cli-artifact.mjs cli-artifact "$CLI_TARGET" "$CLI_SHA"
           tar -xzf "cli-artifact/rsrs-${CLI_TARGET}-runtime.tar.gz" -C cli-artifact
       - name: Fetch BGE model
@@ -201,7 +284,7 @@ jobs:
           TARGET_CXXFLAGS: ${{ matrix.cflags }}
       - name: Collect installers and source identities
         env:
-          CLI_SHA: ${{ inputs.cli_sha }}
+          CLI_SHA: ${{ needs.release.outputs.cli_sha || inputs.cli_sha }}
         run: |
           set -euo pipefail
           T="${{ matrix.target }}"
@@ -236,15 +319,73 @@ jobs:
           path: dist/
           if-no-files-found: error
           retention-days: 14
-      - name: Upload to respire-releases
-        if: inputs.publish
+
+  publish:
+    if: github.event_name == 'push' || inputs.publish
+    needs: [release, client]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: desktop-*-${{ needs.release.outputs.client_sha }}
+          path: packages
+      - name: Publish the completed installer set to this repository
         env:
-          GH_TOKEN: ${{ secrets.RELEASES_GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.release.outputs.tag }}
+          CHANNEL: ${{ needs.release.outputs.channel }}
+          CLIENT_SHA: ${{ needs.release.outputs.client_sha }}
+          CLI_SHA: ${{ needs.release.outputs.cli_sha || inputs.cli_sha }}
+          CLI_TAG: ${{ needs.release.outputs.cli_tag }}
         run: |
           set -euo pipefail
-          gh release upload "$TAG" "dist/${{ matrix.asset }}" --repo risense-ai/respire-releases --clobber
-          RPM="${{ matrix.rpm_asset }}"
-          if [ -n "$RPM" ]; then
-            gh release upload "$TAG" "dist/$RPM" --repo risense-ai/respire-releases --clobber
+          mkdir release-assets
+          shopt -s nullglob
+          for directory in packages/*; do
+            (cd "$directory" && sha256sum --check SHA256SUMS)
+            for installer in "$directory"/*.deb "$directory"/*.rpm "$directory"/*.dmg "$directory"/*.exe; do
+              cp "$installer" release-assets/
+            done
+          done
+          test "$(find release-assets -type f | wc -l)" = 7 || { echo "::error::expected all seven installers from five platforms"; exit 1; }
+          cp packages/*/cli-build-*.json release-assets/
+          printf 'Client: %s\nCLI release: %s\nCLI source: %s\n' "$CLIENT_SHA" "$CLI_TAG" "$CLI_SHA" > release-assets/BUILD-SOURCES.txt
+          (cd release-assets && sha256sum * > SHA256SUMS)
+          ARGS=(--verify-tag)
+          if [ "$CHANNEL" = dev ]; then ARGS=(--target "$CLIENT_SHA" --prerelease); fi
+          gh release create "$TAG" release-assets/* --repo "$GITHUB_REPOSITORY" \
+            "${ARGS[@]}" --title "$TAG" --notes-file release-assets/BUILD-SOURCES.txt
+          echo "Installers published in $GITHUB_REPOSITORY. Cross-repository mirroring requires RELEASES_GITHUB_TOKEN." >> "$GITHUB_STEP_SUMMARY"
+  mirror:
+    if: github.event_name == 'push' || inputs.publish
+    needs: [release, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Mirror only when cross-repository publication is configured
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MIRROR_TOKEN: ${{ secrets.RELEASES_GITHUB_TOKEN }}
+          TAG: ${{ needs.release.outputs.tag }}
+          CHANNEL: ${{ needs.release.outputs.channel }}
+        run: |
+          set -euo pipefail
+          if [ -z "$MIRROR_TOKEN" ]; then
+            echo "::warning::RELEASES_GITHUB_TOKEN is not configured; installers are available in $GITHUB_REPOSITORY, not mirrored to respire-releases."
+            echo "Mirror not configured. Download from https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir mirror-assets
+          ARGS=()
+          if [ "$CHANNEL" = dev ]; then ARGS=(--prerelease); fi
+          mv mirror-assets/SHA256SUMS mirror-assets/DESKTOP-SHA256SUMS
+          if GH_TOKEN="$MIRROR_TOKEN" gh release view "$TAG" --repo risense-ai/respire-releases > /dev/null 2>&1; then
+            GH_TOKEN="$MIRROR_TOKEN" gh release upload "$TAG" mirror-assets/* --repo risense-ai/respire-releases --clobber
+          else
+            GH_TOKEN="$MIRROR_TOKEN" gh release create "$TAG" mirror-assets/* --repo risense-ai/respire-releases \
+              "${ARGS[@]}" --title "$TAG" --notes-file mirror-assets/BUILD-SOURCES.txt
           fi
