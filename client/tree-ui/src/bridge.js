@@ -1,3 +1,5 @@
+import {memoryResult, isMemoryEnvelope} from './runtimeResult.js';
+
 // Bridge the tree UI to the real memory store through Tauri invoke.
 // Native writes await explicit list/create/update/delete/attach calls instead of diffing snapshots.
 // This bridge provides no demo data when Tauri is unavailable.
@@ -11,13 +13,17 @@ function invokeError(e) {
   try { return JSON.stringify(e); } catch { return String(e); }
 }
 
-async function call(cmd, args) {
+async function invokeRuntime(cmd, args) {
   if (!isNative) throw new Error('当前不是本地客户端');
   try {
     return await invoke(cmd, args);
   } catch (e) {
     throw new Error(invokeError(e));
   }
+}
+
+async function call(cmd, args) {
+  return memoryResult(cmd, await invokeRuntime(cmd, args));
 }
 
 function kindOf(value) {
@@ -63,11 +69,16 @@ export function toMemory(e) {
   };
 }
 
-export async function boot() {
+export async function bootSnapshot() {
   if (!isNative) return null;
-  const list = await call('list', { limit: 100000 });
+  const raw = await invokeRuntime('list', {limit: 100000});
+  const list = memoryResult('list', raw);
   if (!Array.isArray(list)) throw new Error('list 返回不是数组');
-  return list.map(toMemory).filter(Boolean);
+  return {memories: list.map(toMemory).filter(Boolean), profile: isMemoryEnvelope(raw) ? raw.summary?.profile : null};
+}
+
+export async function boot() {
+  return (await bootSnapshot())?.memories ?? null;
 }
 
 export async function searchMemories(query) {
@@ -94,7 +105,9 @@ export async function createMemory({ title, content, type, tags, parent, importa
   if (importance) args.importance = importance;
   const created = await call('create', args);
   if (created?.status === 'candidates') throw new Error('未写入：存在相似候选');
-  const memory = toMemory(created);
+  // Current remember envelopes return the committed ID, not the full entry.
+  const memory = toMemory(created?.id && !Object.hasOwn(created, 'content')
+    ? await call('show', {id: created.id}) : created);
   if (!memory?.id) throw new Error('创建未返回记忆 ID');
   return memory;
 }
@@ -110,7 +123,7 @@ export async function updateMemory(id, { title, content, type, tags, importance 
   if (importance) args.importance = importance;
   const updated = await call('update', args);
   const memory = toMemory(updated);
-  if (!memory?.id) throw new Error('更新未返回记忆');
+  if (!memory?.id || memory.id !== id) throw new Error('更新未返回对应记忆');
   return memory;
 }
 
@@ -129,7 +142,9 @@ export async function attachMemory(id, parent) {
 }
 
 export async function restoreMemory(id) {
-  const memory = toMemory(await call('restore', { id }));
+  const restored = await call('restore', { id });
+  const memory = toMemory(restored?.id && !Object.hasOwn(restored, 'content')
+    ? await call('show', {id: restored.id}) : restored);
   if (!memory?.id || memory.id !== id) throw new Error('恢复未返回对应记忆');
   return memory;
 }

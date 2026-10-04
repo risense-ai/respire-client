@@ -9,3 +9,7 @@ client/src-tauri/tauri.core-runtime.conf.json
 client/src-tauri/binaries/*.dll
 client/src-tauri/binaries/*.exe
 /models/
+
+# Browser regression output
+client/tree-ui/test-results/
+client/tree-ui/playwright-report/

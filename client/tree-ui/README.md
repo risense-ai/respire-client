@@ -57,3 +57,51 @@ Tree navigation supports expanding nodes, viewing descendants, editing, and movi
 | Escape | Close the current dialog |
 
 Text inputs retain their normal editing behavior. Chinese interface text, protocol strings, and test fixtures remain unchanged. Bundled fonts retain their original licenses.
+
+## Automatic refresh contract
+
+The desktop polls `rsrs memory-revision` every five seconds while visible and idle.
+The producer must return `ResultEnvelope.summary = {profile, revision}`, and `list`
+must identify its own store in `ResultEnvelope.summary.profile`. The revision is
+an opaque token; compare the entire profile/token pair. Neither counts, timestamps,
+nor SQLite main-file/WAL modification times are a complete substitute.
+
+The matching CLI producer is the `fix/memory-refresh-revision` change in
+`risense-ai/respire-cli` (built from base `d913897b3081e208642350f6b5b6400678c9cd2a`).
+The command is capability-detected rather than inferred from `1.0.x` version numbers.
+Ship a CLI release containing that producer before shipping this Client update.
+Current published CLIs without the command retain initial/manual reads, show a
+clear upgrade warning, and do not repeatedly load plaintext for change detection.
+The native `db_stamp` implementation has been replaced; frontend and native shell
+must be built together.
+
+A changed token triggers a status/list read, followed by a second token check.
+The status and list must identify the same profile as both token reads, including
+A→B→A switches during a request. Failed or stale reads keep existing data and do
+not advance the applied baseline. Active editors/dialogs pause automatic reads;
+late completions cannot overwrite an in-progress edit. Same-profile refreshes
+keep selection and expansion; profile changes reset the view. Failures use bounded
+backoff, and manual refresh bypasses it.
+
+Memory/status/edit/sync response normalization accepts legacy bare results and
+current CLI envelopes only for the named operations in `runtimeResult.js`. This
+is not a complete account/configuration/authentication contract migration.
+
+### Regression checks
+
+```sh
+npm test
+npm run build
+npx playwright install chromium
+npm run test:browser
+# From repository root, without the native platform SDK:
+rustc --edition=2021 --test client/src-tauri/src/memory_args.rs -o /tmp/respire-memory-args-tests
+/tmp/respire-memory-args-tests
+```
+
+Browser tests use only a synthetic intercepted CLI. They cover React StrictMode
+startup, legacy/manual fallback, cheap unchanged polls, external updates/deletion,
+editing importance in both directions, and a dialog opening during a pending read.
+They do not validate a Tauri webview or installed desktop CLI. Full native checking
+still requires Rust plus the Tauri platform SDK; packaging and release validation
+remain separate.

@@ -17,6 +17,10 @@ jobs:
           node-version: 22
       - name: Parse compatibility matrix
         run: node -e "const m=JSON.parse(require('fs').readFileSync('contracts/compatibility-matrix.json','utf8')); if (m.schemaVersion !== 1) process.exit(1);"
+      - name: Native memory argument contract
+        run: |
+          rustc --edition=2021 --test client/src-tauri/src/memory_args.rs -o /tmp/respire-memory-args-tests
+          /tmp/respire-memory-args-tests
       - name: Sidecar script syntax
         run: |
           bash -n build/stage-desktop-bundle.sh
@@ -38,3 +42,5 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm run build
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:browser
