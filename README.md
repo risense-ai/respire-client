@@ -77,3 +77,10 @@ gh workflow run release.yml --repo risense-ai/respire-client \
 ```
 
 Manual `publish=true` requires a version tag matching `tauri.conf.json` and publishes to this repository with its Actions token. Mirroring to `respire-releases` separately requires `RELEASES_GITHUB_TOKEN`; an unconfigured mirror reports that status and the working download URL explicitly. macOS signing/notarization and Windows signing are not configured; successful package construction does not establish those distribution guarantees. Bundled CLI runtime files are resolved through Tauri's platform resource directory when installing the CLI into the user PATH.
+
+## License
+
+First-party material is offered under [PolyForm Noncommercial 1.0.0](LICENSE).
+Personal noncommercial use and self-hosting are permitted; commercial use,
+including internal commercial deployment, requires a separate written license.
+See [commercial licensing and component exceptions](COMMERCIAL-LICENSE.md).
