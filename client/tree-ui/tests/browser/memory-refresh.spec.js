@@ -80,6 +80,7 @@ test('active editor survives an external revision and importance saves both ways
   await expect(dialog.getByLabel('名称', {exact: true})).toHaveValue('Unsaved local title');
   console.info('editor select labels', await dialog.locator('select').evaluateAll(controls => controls.map(control => [...control.labels].map(label => label.textContent))));
   await expect(dialog.getByRole('combobox', {name: /重要性/})).toHaveCount(1);
+  await expect(dialog.getByRole('combobox', {name: /重要性/})).toHaveAccessibleName('重要性');
   await dialog.getByRole('combobox', {name: /重要性/}).selectOption('trivial');
   await dialog.getByRole('button', {name: '保存', exact: true}).click();
   await expect(dialog).toHaveCount(0);
