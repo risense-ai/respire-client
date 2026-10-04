@@ -271,3 +271,6 @@ html[data-theme=dark] .tw-tab.active { color:#e6e8ec;border-bottom-color:#e6e8ec
 .tw-pref-ctrl input[type=checkbox] { width:auto; }
 /* Give action buttons a shared minimum width so input columns align. */
 .tw-pref-ctrl .button { min-width:96px; }
+
+.tw-refresh-status{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:8px 20px;font-size:12px;border-bottom:1px solid var(--border);overflow-wrap:anywhere}
+.tw-refresh-status .text-link{flex-shrink:0}

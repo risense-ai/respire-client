@@ -6,9 +6,11 @@ import {splitReadingBlocks} from './readingText.js';
 import {ROOT_ID,DIARY_ID,initialTree,realTree,nodeById,pathFor,subtreeIds,memoriesInScope,canMove,moveNode,makeNodeId,isRealId} from './treeModel.js';
 import {scopePath,scopeDigest,captureScope,enrichGrants,grantsForNode,moveImpact} from './treeAccess.js';
 import DiaryCalendar from './DiaryCalendar.jsx';
-import {boot as bridgeBoot, isNative, createMemory, updateMemory, deleteMemory, restoreMemory, attachMemory, searchMemories, readMemory, purgeMemory} from './bridge.js';
+import {boot as bridgeBoot, bootSnapshot, isNative, createMemory, updateMemory, deleteMemory, restoreMemory, attachMemory, searchMemories, readMemory, purgeMemory} from './bridge.js';
 import {parseBackup} from './backup.js';
-const inv=(cmd,args={})=>{const f=window.__TAURI__?.core?.invoke;return f?f(cmd,args):Promise.reject(new Error("非本地客户端（未连 Tauri）"))};
+import {memoryResult} from './runtimeResult.js';
+import {createMemoryRefresh, readMemorySnapshot, protectionEntered} from './memoryRefresh.js';
+const inv=(cmd,args={})=>{const f=window.__TAURI__?.core?.invoke;return f?f(cmd,args).then(value=>memoryResult(cmd,value)):Promise.reject(new Error("非本地客户端（未连 Tauri）"))};
 const NATIVE=isNative;
 import TreeSidebar from './TreeSidebar.jsx';
 import MemoryGraph from './MemoryGraph.jsx';
@@ -523,38 +525,9 @@ export default function TreeClient(){
  const [bootError,setBootError]=useState(null);
  const [saving,setSaving]=useState(false);const [deleting,setDeleting]=useState(false);
  const [readingMemory,setReadingMemory]=useState(false);const selectionRequest=useRef(0);
- const doBoot=async(keepView=false)=>{
-  if(!window.__TAURI__?.core?.invoke)return;
-  let st=null,err=null;
-  try{st=await inv('status')}catch(e){err=errText(e)}
-  if(err||!st){
-   setBootError(err||'无法读取状态');
-   if(!bridged)setShowGate(true);
-   return;
-  }
-  setStatusInfo(st);setBootError(null);setStatusCountsError('');
-  const nextUser=st?.session?.user||null;
-  if(!st.unlocked||nextUser!==userLabel||cloudAuthed(st)!==cloudAuthed(statusInfo)){setSyncResult('');setSyncFailed(false)}
-  try{const ts=await inv('inject_targets');const arr=Array.isArray(ts)?ts:[];setInjectStat({fresh:arr.filter(x=>x.state==='fresh').length,total:arr.length})}catch{}
-  if(st.unlocked){
-   try{
-    const real=await bridgeBoot();
-    if(Array.isArray(real)){
-     setMemories(real);setBridged(true);
-     setNodes(realTree(real));setGrants([]);
-     if(!keepView){
-      const base=[ROOT_ID,DIARY_ID,...real.filter(m=>!m.parentId&&m.importance!=='trivial').slice(0,12).map(m=>m.id)];
-      setExpanded(()=>new Set(base));
-      setSelected(ROOT_ID);
-     }
-     setUserLabel(st?.session?.user||null);
-    } else { setMemories([]);setBootError('记忆库读取失败（list 无响应）');return }
-   }catch(e){ setMemories([]);setBootError(errText(e).slice(0,200));return }
-   return;
-  }
-  recoveryRequest.current++;
-  setBridged(false);setMemories([]);setNodes(realTree([]));setGrants([]);setUserLabel(null);setSelected(ROOT_ID);setRecoveryText('');setShowGate(true);
- };
+ const nativeRefresh=useRef(null);
+ const [refreshError,setRefreshError]=useState('正在检查自动刷新…');
+ const doBoot=(keepView=false)=>nativeRefresh.current?.refresh({force:true,keepView});
 
  const [nodes,setNodes]=useState(()=>{if(NATIVE)return realTree([]);const saved=read('respire-tree-nodes-v1',null);const initial=initialTree(memories);if(!Array.isArray(saved)||!saved.some(n=>n.id===ROOT_ID))return initial;const known=new Set(saved.map(n=>n.id));const live=saved.filter(n=>n.kind!=='memory'||memories.some(m=>m.id===n.memoryId));const liveIds=new Set(live.map(n=>n.id));return [...live.map(n=>n.id!==ROOT_ID&&!liveIds.has(n.parentId)?{...n,parentId:ROOT_ID}:n),...memories.filter(m=>!known.has(m.id)).map(m=>({id:m.id,memoryId:m.id,title:m.title,kind:'memory',parentId:ROOT_ID}))]});
  const [grants,setGrants]=useState(()=>NATIVE?[]:(read('respire-tree-grants-v1',null)||[{id:'grant-claude',tool:'Claude',destination:'Claude Desktop · 个人工作区',scopeId:'tree-product',permission:'read',syncMode:'auto',enabled:true},{id:'grant-codex',tool:'Codex',destination:'Codex · 编程练习平台',scopeId:'mem-04',permission:'write',syncMode:'manual',enabled:true}].filter(g=>nodeById(nodes,g.scopeId)).map(g=>captureScope(g,nodes,memories))));
@@ -577,22 +550,62 @@ export default function TreeClient(){
   catch(e){notify('读取详情失败：'+errText(e))}
   finally{setDiaryLoading(false)}
  };
- useEffect(()=>{doBoot()},[]);
- // Poll database modification time every five seconds and preserve selection and expansion state during refresh.
- // Skip refresh while dialogs, editing, saving, or a background window could interrupt the user.
- const doBootRef=useRef(doBoot);doBootRef.current=doBoot;
- const [dbStamp,setDbStamp]=useState(null);
+ // Poll only the CLI-resolved opaque revision. No plaintext list reads while unchanged.
+ // Live guards are checked after every await as well as before starting a request.
+ const refreshState=useRef(null);
+ refreshState.current={editor,saving,deleting,readingMemory,syncBusy,backupBusy,reembedBusy,
+  searchOpen,installDialog,moveDialog,deleteDialog,shareDialog,preferences,help,showGate,diaryDay,diaryDetail};
+ const refreshCallbacks=useRef(null);
+ refreshCallbacks.current={
+  apply:({status:st,memories:real,injectTargets},{keepView,profileChanged})=>{
+   if(Array.isArray(injectTargets))setInjectStat({fresh:injectTargets.filter(x=>x.state==='fresh').length,total:injectTargets.length});
+   selectionRequest.current++;
+   setStatusInfo(st);setBootError(null);setStatusCountsError('');
+   if(profileChanged||!st.unlocked||st?.session?.user!==userLabel||cloudAuthed(st)!==cloudAuthed(statusInfo)){
+    setSyncResult('');setSyncFailed(false);
+   }
+   if(st.unlocked){
+    setMemories(real);setBridged(true);setNodes(realTree(real));setGrants([]);
+    if(!keepView||profileChanged){
+     setExpanded(new Set([ROOT_ID,DIARY_ID,...real.filter(m=>!m.parentId&&m.importance!=='trivial').slice(0,12).map(m=>m.id)]));
+     setSelected(ROOT_ID);
+    }else{
+     const ids=new Set(realTree(real).map(node=>node.id));
+     setSelected(previous=>ids.has(previous)?previous:ROOT_ID);
+    }
+    setUserLabel(st?.session?.user||null);
+   }else{
+    recoveryRequest.current++;
+    setBridged(false);setMemories([]);setNodes(realTree([]));setGrants([]);setUserLabel(null);
+    setSelected(ROOT_ID);setRecoveryText('');setShowGate(true);
+   }
+  },
+  reportError:message=>{setRefreshError(message);if(message&&!bridged)setBootError(message)},
+ };
  useEffect(()=>{
   if(!NATIVE)return;
-  const iv=setInterval(async()=>{
-   if(document.hidden||editor||saving||deleting||searchOpen||installDialog||moveDialog||deleteDialog)return;
-   try{
-    const s=await inv('db_stamp');
-    if(typeof s==='number'&&s>0) setDbStamp(prev=>{ if(prev!=null&&s!==prev){try{doBootRef.current(true)}catch{}} return s; });
-   }catch{}
-  },5000);
-  return()=>clearInterval(iv);
- },[editor,saving,deleting,searchOpen,installDialog,moveDialog,deleteDialog]);
+  const controller=createMemoryRefresh({
+   readRevision:()=>inv('memory_revision'),
+   readSnapshot:async options=>{const snapshot=await readMemorySnapshot(inv,bootSnapshot,options);try{snapshot.injectTargets=await inv('inject_targets')}catch{}return snapshot},
+   apply:(...args)=>refreshCallbacks.current.apply(...args),
+   reportError:message=>refreshCallbacks.current.reportError(message),
+   isPaused:({force})=>{
+    const state=refreshState.current;
+    const hard=state.editor||state.saving||state.deleting||state.readingMemory||state.syncBusy||state.backupBusy||state.reembedBusy;
+    return hard||(!force&&(document.hidden||Object.values(state).some(Boolean)||document.querySelector('[role="dialog"]')));
+   },
+  });
+  nativeRefresh.current=controller;
+  controller.refresh({force:true,keepView:false});
+  const poll=()=>controller.refresh();
+  const visible=()=>{if(document.hidden)controller.invalidate();else poll()};
+  const interval=setInterval(poll,5000);
+  document.addEventListener('visibilitychange',visible);
+  return()=>{clearInterval(interval);document.removeEventListener('visibilitychange',visible);controller.dispose();if(nativeRefresh.current===controller)nativeRefresh.current=null};
+ },[]);
+ // Entering protection invalidates old reads; closing a dialog may start a new forced read.
+ const previousRefreshState=useRef({});
+ useEffect(()=>{if(protectionEntered(previousRefreshState.current,refreshState.current))nativeRefresh.current?.invalidate();previousRefreshState.current=refreshState.current},[editor,saving,deleting,readingMemory,syncBusy,backupBusy,reembedBusy,searchOpen,installDialog,moveDialog,deleteDialog,shareDialog,preferences,help,showGate,diaryDay,diaryDetail]);
  useEffect(()=>{if(bridged)setNodes(realTree(memories))},[bridged,memories]);
  // The diary_mode agent setting controls how much incidental activity AI records.
  const [diaryVerbose,setDiaryVerbose]=useState(false);const [diaryBusy,setDiaryBusy]=useState(false);
@@ -600,7 +613,7 @@ export default function TreeClient(){
  const toggleDiary=async()=>{setDiaryBusy(true);try{const nv=!diaryVerbose;await inv('diary_mode_set',{mode:nv?'verbose':'concise'});setDiaryVerbose(nv);notify(nv?'已开启琐事详记：逐条记录':'已切回轨迹档：琐事一日一条')}catch(e){notify('切换失败：'+errText(e))}finally{setDiaryBusy(false)}};
  const notify=(text,undo,actionLabel='撤销')=>{undoRef.current=undo;clearTimeout(toastTimer.current);setToast({text,undo,actionLabel});toastTimer.current=setTimeout(()=>{undoRef.current=null;setToast(null)},undo?30000:4000)};
  const log=(kind,title,nodeId,detail='')=>{setActivity(a=>[{id:makeNodeId(),kind,title,nodeId,detail,at:new Date().toISOString()},...a]);setLastSavedAt(new Date().toISOString())};
- const paintNative=list=>{setMemories(list);setNodes(realTree(list))};
+ const paintNative=list=>{nativeRefresh.current?.invalidate();setMemories(list);setNodes(realTree(list))};
  const refreshNativeStatus=async()=>{
   try{
    const st=await inv('status');
@@ -942,6 +955,7 @@ export default function TreeClient(){
    <nav className="dock" aria-label="核心导航">{[['tree',TreeStructure,'记忆树'],['sync',ArrowsClockwise,'同步'],['install',PlugsConnected,'注入'],['cure',Sparkle,'治理']].map(([id,I,label])=><button key={id} className={page===id?'active':''} onClick={()=>{setPage(id);setMobileSide(false)}}><I size={20}/><span>{label}</span></button>)}</nav>
   </aside>
   <div className="workspace">
+   {NATIVE&&<div className="tw-refresh-status" role="status"><span>{refreshError||'记忆自动刷新已启用'}</span><button className="text-link" disabled={!!editor||saving||deleting||syncBusy||backupBusy} onClick={()=>doBoot(true)}><ArrowClockwise size={14}/>手动刷新</button></div>}
    <header className="topbar tw-topbar"><div className="breadcrumbs"><IconButton label="切换侧栏" onClick={()=>setMobileSide(!mobileSide)}><SidebarSimple size={19}/></IconButton><span className="tw-workspace-label">{(userLabel||'本机')+" 的工作区"}</span><CaretRight size={12}/><strong>{page==='tree'?'记忆树':page==='sync'?'云端同步':page==='cure'?'树况治理':'注入到 AI'}</strong></div><span className="tw-local-badge" title={bridged?(statusInfo?.data_dir||'~/.respire'):undefined}><span className="status-dot"/><span className="tw-local-badge-text">{bridged?(statusInfo?.offline?'离线本机（仅此电脑）':`已连接（${statusInfo?.data_dir||'~/.respire'}）`):"未接入"}</span></span><IconButton label="外观与数据" onClick={()=>setPreferences(true)}><span className="small-avatar">{(userLabel||"本").slice(0,1)}</span></IconButton></header>
    <div className="tw-location"><div className="tw-breadcrumb-path" aria-label="当前节点路径">{path.map((node,i)=><React.Fragment key={node.id}>{i>0&&<CaretRight size={11}/>}<button title={node.title} onClick={()=>select(node.id)} className={i===path.length-1?'current':''}>{i===0&&<TreeStructure size={14}/>}<span>{node.title}</span></button></React.Fragment>)}</div></div>
    {page==='tree'?<div className="memory-workspace"><main className="main-pane"><div className="content-toolbar"><div className="view-tabs">{[['tree',TreeStructure,'Tree'],['activity',Clock,'Activity'],['graph',Link,'Graph']].map(([id,I,label])=><button key={id} className={view===id?'active':''} aria-pressed={view===id} onClick={()=>setView(id)}><I size={14}/>{label}</button>)}</div><div className="toolbar-actions"><span className="saved-label" role="status"><Check size={12}/>{readingMemory?'正在读取记忆…':'本机已保存'}</span><IconButton label="切换作用域检查器" onClick={()=>setInspector(!inspector)}><SidebarSimple size={18} style={{transform:'rotate(180deg)'}}/></IconButton></div></div>

@@ -3,6 +3,8 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod memory_args;
+
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
@@ -153,31 +155,10 @@ async fn status() -> Result<serde_json::Value, String> {
     cli_bg(&["status"]).await
 }
 
-/// Poll database modification time in milliseconds to detect external CLI writes.
-/// Data directory precedence matches the CLI: environment override, configured directory, then the default user directory.
+/// Ask the CLI for its profile-scoped revision; never guess storage paths or WAL state.
 #[tauri::command]
-async fn db_stamp() -> Result<u64, String> {
-    let home = std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
-        .map_err(|_| "无法确定用户目录".to_owned())?;
-    let env_dir = std::env::var("ONEMEMORY_DATA_DIR").ok().filter(|s| !s.trim().is_empty());
-    let cfg_dir: Option<String> = std::fs::read_to_string(PathBuf::from(&home).join(".respire/client.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v["data_dir"].as_str().filter(|s| !s.is_empty()).map(ToOwned::to_owned));
-    let base = env_dir
-        .or(cfg_dir)
-        .map(|v| {
-            if let Some(rest) = v.strip_prefix("~/") {
-                PathBuf::from(&home).join(rest)
-            } else {
-                PathBuf::from(v)
-            }
-        })
-        .unwrap_or_else(|| PathBuf::from(&home).join(".respire"));
-    let db = base.join("onememory.db");
-    let m = std::fs::metadata(&db).map_err(|e| format!("无库文件：{e}"))?;
-    let t = m.modified().map_err(|e| e.to_string())?;
-    Ok(t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0))
+async fn memory_revision() -> Result<serde_json::Value, String> {
+    cli_bg(&["memory-revision"]).await
 }
 
 #[tauri::command]
@@ -269,20 +250,9 @@ async fn update(
     content: Option<String>,
     tags: Option<String>,
     kind: Option<String>,
+    importance: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let mut args: Vec<String> = vec!["update".into(), id];
-    if let Some(v) = title {
-        args.extend(["--title".into(), v]);
-    }
-    if let Some(v) = content {
-        args.extend(["--content".into(), v]);
-    }
-    if let Some(v) = tags {
-        args.extend(["--tags".into(), v]);
-    }
-    if let Some(v) = kind {
-        args.extend(["--kind".into(), v]);
-    }
+    let args = memory_args::update_args(id, title, content, tags, kind, importance);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     cli(&refs)
 }
@@ -1175,7 +1145,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            status, list, search, show, tree, db_stamp,
+            status, list, search, show, tree, memory_revision,
             candidates, create, update, delete, purge, restore, attach, promote,
             sync,
             logout,
