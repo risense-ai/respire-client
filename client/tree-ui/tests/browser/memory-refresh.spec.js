@@ -78,14 +78,16 @@ test('active editor survives an external revision and importance saves both ways
   state.rows[0].title = 'External revision'; state.revision++;
   await page.clock.fastForward(5100);
   await expect(dialog.getByLabel('名称', {exact: true})).toHaveValue('Unsaved local title');
-  await dialog.getByLabel('重要性', {exact: true}).selectOption('trivial');
+  console.info('editor select labels', await dialog.locator('select').evaluateAll(controls => controls.map(control => [...control.labels].map(label => label.textContent))));
+  await expect(dialog.getByRole('combobox', {name: /重要性/})).toHaveCount(1);
+  await dialog.getByRole('combobox', {name: /重要性/}).selectOption('trivial');
   await dialog.getByRole('button', {name: '保存', exact: true}).click();
   await expect(dialog).toHaveCount(0);
   expect(state.rows[0].importance).toBe('trivial');
   await expect(page.getByRole('heading', {name: 'Unsaved local title', exact: true, level: 1})).toBeVisible();
   await page.getByRole('button', {name: '节点操作'}).click();
   await page.getByRole('button', {name: /编辑记忆/}).click();
-  await page.getByRole('dialog').getByLabel('重要性', {exact: true}).selectOption('important');
+  await page.getByRole('dialog').getByRole('combobox', {name: /重要性/}).selectOption('important');
   await page.getByRole('dialog').getByRole('button', {name: '保存', exact: true}).click();
   await expect(page.getByRole('dialog')).toHaveCount(0);
   expect(state.rows[0].importance).toBe('important');
@@ -102,8 +104,14 @@ test('opening and closing a dialog invalidates an already pending list', async (
   await page.getByRole('button', {name: '外观与数据'}).click();
   await expect(page.getByRole('dialog')).toBeVisible();
   await page.getByRole('dialog').getByRole('button', {name: '关闭'}).click();
+  const response = page.waitForResponse(r => r.url().endsWith('/api/invoke') && r.request().postDataJSON().cmd === 'list');
   release(); state.beforeList = null;
+  await response;
+  await page.clock.runFor(50);
   await expect(page.getByRole('treeitem', {name: /First memory/})).toBeVisible();
-  await page.clock.fastForward(5100);
+  // Drain the deferred network completion before advancing the next timer.
+  const readsBeforeRetry = state.calls.filter(cmd => cmd === 'list').length;
+  await page.clock.runFor(5100);
   await expect(page.getByRole('treeitem', {name: /Pending snapshot/})).toBeVisible();
+  expect(state.calls.filter(cmd => cmd === 'list').length).toBe(readsBeforeRetry + 1);
 });

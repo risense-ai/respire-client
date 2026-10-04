@@ -66,8 +66,8 @@ must identify its own store in `ResultEnvelope.summary.profile`. The revision is
 an opaque token; compare the entire profile/token pair. Neither counts, timestamps,
 nor SQLite main-file/WAL modification times are a complete substitute.
 
-The matching CLI producer is the `fix/memory-refresh-revision` change in
-`risense-ai/respire-cli` (built from base `d913897b3081e208642350f6b5b6400678c9cd2a`).
+The matching CLI producer is [respire-cli PR #14](https://github.com/risense-ai/respire-cli/pull/14),
+built from base `a15da0069d4dedbbcb7283543584d89cc1e10e13`.
 The command is capability-detected rather than inferred from `1.0.x` version numbers.
 Ship a CLI release containing that producer before shipping this Client update.
 Current published CLIs without the command retain initial/manual reads, show a
