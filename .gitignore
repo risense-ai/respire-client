@@ -1,0 +1,11 @@
+
+node_modules/
+target/
+*.db
+
+
+client/src-tauri/binaries/runtime/
+client/src-tauri/tauri.core-runtime.conf.json
+client/src-tauri/binaries/*.dll
+client/src-tauri/binaries/*.exe
+/models/
