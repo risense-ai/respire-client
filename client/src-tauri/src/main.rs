@@ -1,5 +1,6 @@
 //! The desktop shell translates frontend invokes into rsrs CLI subprocess calls.
-//! Return stdout JSON unchanged; memory business logic stays in the CLI.
+//! Return stdout JSON unchanged. CLI hosts storage and resources; private memory
+//! policies and inference stay in its binary Core dependency.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -7,12 +8,24 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
 
-/// Resolve the CLI through ONEMEMORY_CLI, the executable directory, PATH, then /usr/bin/rsrs.
+/// Canonical names win, including explicit empty values. Legacy names are read
+/// only; account and encryption migration belongs to the CLI.
+fn configuration_env(name: &str) -> Result<String, std::env::VarError> {
+    let value = std::env::var_os(name).or_else(|| {
+        let suffix = name.strip_prefix("RSRS_")?;
+        std::env::var_os(format!("ONEMEMORY_{suffix}"))
+            .or_else(|| std::env::var_os(format!("RESPIRE_{suffix}")))
+    });
+    value.ok_or(std::env::VarError::NotPresent)?
+        .into_string().map_err(std::env::VarError::NotUnicode)
+}
+
+/// Resolve the CLI through RSRS_CLI, the executable directory, PATH, then /usr/bin/rsrs.
 /// Prefer the matching bundled CLI to avoid command-contract mismatches.
 fn cli_path() -> String {
     static CLI: OnceLock<String> = OnceLock::new();
     CLI.get_or_init(|| {
-        if let Ok(p) = std::env::var("ONEMEMORY_CLI") {
+        if let Ok(p) = configuration_env("RSRS_CLI") {
             if !p.trim().is_empty() {
                 return p;
             }
@@ -82,8 +95,9 @@ fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
 
 fn cli_output(args: &[&str]) -> Result<(bool, String, String), String> {
     let out = hidden_command(cli_path())
+        .arg("--json")
         .args(args)
-        .env("ONEMEMORY_JSON", "1")
+        .env("RSRS_JSON", "1")
         .output()
         .map_err(|_| {
             "无法启动 rsrs CLI——请先安装：客户端「工作区设置 → 安装 CLI」或 npm i -g @rsrsai/cli"
@@ -134,10 +148,10 @@ async fn cli_bg(args: &[&str]) -> Result<serde_json::Value, String> {
     .map_err(|e| format!("后台任务失败：{e}"))?
 }
 
-/// Respect the process ONEMEMORY_ADDR override when displaying configuration.
+/// Respect the process RSRS_ADDR override when displaying configuration.
 fn overlay_process_addr(mut v: serde_json::Value) -> Result<serde_json::Value, String> {
     let config = v.as_object_mut().ok_or("CLI 配置输出必须是 JSON 对象")?;
-    if let Ok(addr) = std::env::var("ONEMEMORY_ADDR") {
+    if let Ok(addr) = configuration_env("RSRS_ADDR") {
         let addr = addr.trim();
         if !addr.is_empty() {
             config.insert("addr".to_owned(), serde_json::Value::String(addr.to_owned()));
@@ -159,8 +173,8 @@ async fn status() -> Result<serde_json::Value, String> {
 async fn db_stamp() -> Result<u64, String> {
     let home = std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
         .map_err(|_| "无法确定用户目录".to_owned())?;
-    let env_dir = std::env::var("ONEMEMORY_DATA_DIR").ok().filter(|s| !s.trim().is_empty());
-    let cfg_dir: Option<String> = std::fs::read_to_string(PathBuf::from(&home).join(".respire/client.json"))
+    let env_dir = configuration_env("RSRS_DATA_DIR").ok().filter(|s| !s.trim().is_empty());
+    let cfg_dir: Option<String> = std::fs::read_to_string(PathBuf::from(&home).join(".rsrs/client.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
         .and_then(|v| v["data_dir"].as_str().filter(|s| !s.is_empty()).map(ToOwned::to_owned));
@@ -173,8 +187,13 @@ async fn db_stamp() -> Result<u64, String> {
                 PathBuf::from(v)
             }
         })
-        .unwrap_or_else(|| PathBuf::from(&home).join(".respire"));
-    let db = base.join("onememory.db");
+        .unwrap_or_else(|| PathBuf::from(&home).join(".rsrs"));
+    let current = base.join("rsrs.db");
+    let legacy = base.join("onememory.db");
+    if current.is_file() && legacy.is_file() {
+        return Err("目录同时包含新旧数据库，请明确选择数据目录".to_owned());
+    }
+    let db = if current.is_file() { current } else { legacy };
     let m = std::fs::metadata(&db).map_err(|e| format!("无库文件：{e}"))?;
     let t = m.modified().map_err(|e| e.to_string())?;
     Ok(t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0))
@@ -683,16 +702,16 @@ async fn rerank_model_status() -> Result<serde_json::Value, String> {
 
 /// Resolve the reranker directory from explicit overrides or the user model root.
 fn rerank_model_dir() -> PathBuf {
-    if let Ok(p) = std::env::var("ONEMEMORY_RERANKER_DIR") {
+    if let Ok(p) = configuration_env("RSRS_RERANKER_DIR") {
         let p = p.trim();
         if !p.is_empty() {
             return PathBuf::from(p);
         }
     }
-    if let Ok(p) = std::env::var("ONEMEMORY_MODEL_DIR") {
+    if let Ok(p) = configuration_env("RSRS_MODEL_DIR") {
         let p = p.trim();
         if !p.is_empty() {
-            // ONEMEMORY_MODEL_DIR names the embedding model directory; use its parent as the model root.
+            // RSRS_MODEL_DIR names the embedding model directory; use its parent as the model root.
             let b = PathBuf::from(p);
             if let Some(parent) = b.parent() {
                 return parent.join("bge-reranker-base");
@@ -725,7 +744,7 @@ async fn rerank_model_install(app: tauri::AppHandle, source: Option<String>, mir
         // Without a custom source, resolve the mirror argument or environment override.
         let m = mirror
             .filter(|s| !s.trim().is_empty())
-            .or_else(|| std::env::var("ONEMEMORY_MIRROR").ok().filter(|s| !s.trim().is_empty()));
+            .or_else(|| configuration_env("RSRS_MIRROR").ok().filter(|s| !s.trim().is_empty()));
         if let Some(m) = m {
             args.push("--mirror".into());
             args.push(m);
@@ -734,8 +753,9 @@ async fn rerank_model_install(app: tauri::AppHandle, source: Option<String>, mir
     let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
 
     let mut child = hidden_command(cli_path())
+        .arg("--json")
         .args(&arg_refs)
-        .env("ONEMEMORY_JSON", "1")
+        .env("RSRS_JSON", "1")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -1137,7 +1157,7 @@ async fn pick_open_file(app: tauri::AppHandle) -> Result<Option<String>, String>
 }
 
 fn webview_data_dir() -> Option<PathBuf> {
-    match std::env::var("ONEMEMORY_WEBVIEW_DIR") {
+    match configuration_env("RSRS_WEBVIEW_DIR") {
         Ok(dir) => {
             let dir = dir.trim();
             if dir.is_empty() {
