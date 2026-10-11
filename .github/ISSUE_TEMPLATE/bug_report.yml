@@ -1,0 +1,64 @@
+name: "Bug report / 缺陷报告"
+description: "Desktop or shared Web UI failures / 桌面或共享 Web 界面问题"
+title: "[Bug] "
+body:
+  -
+    type: "markdown"
+    attributes:
+      value: "Use English or 中文. Search existing issues first. Never post passwords, API keys/tokens, databases/backups, private memories, account identifiers or unredacted logs/screenshots. / 可用中英文；先搜索现有问题。不要提交密码、密钥/token、数据库/备份、私密记忆、账户标识或未脱敏日志/截图。\n\nSecurity vulnerabilities: do not disclose details in a public Issue or PR. Check this repository's Security tab for a private reporting option; if none is offered, ask maintainers to establish a private channel without including vulnerability details. No security email or private channel is currently documented. / 安全漏洞不要公开披露；查看本仓库 Security 页是否提供私密报告入口。若没有，只请求维护者建立私密渠道，不附漏洞细节。目前未公布安全邮箱或私密渠道。"
+  -
+    type: "textarea"
+    id: "summary"
+    attributes:
+      label: "Problem / 问题概述"
+      description: "One concrete problem and its impact. / 描述一个具体问题及影响。"
+    validations:
+      required: true
+  -
+    type: "textarea"
+    id: "versions"
+    attributes:
+      label: "Client and CLI versions / Client 与 CLI 版本"
+      description: "Include client version/release channel or commit, bundled/external rsrs version if known, desktop installer filename/source; for Web UI include browser/version and deployment/build version if known. Unknown is OK if startup fails. / 提供客户端版本/渠道、CLI 版本、安装包来源；Web 提供浏览器及构建版本。"
+    validations:
+      required: true
+  -
+    type: "textarea"
+    id: "environment"
+    attributes:
+      label: "Platform and UI context / 平台与界面环境"
+      description: "Desktop: Windows/macOS/Linux version and architecture, installer type (NSIS/DMG/DEB/RPM), WebView2/WebKit version if known. Web: browser/version. For UI issues add language, theme, display scale/zoom and affected view (tree/diary/settings/memory). / 按桌面或 Web 填写适用信息；界面问题补充语言、主题、缩放和页面。"
+    validations:
+      required: true
+  -
+    type: "textarea"
+    id: "reproduction"
+    attributes:
+      label: "Minimal UI steps / 最小界面复现步骤"
+      description: "Numbered steps from a known starting state using synthetic data; describe clicks/keyboard actions and repeat rate. Include desktop vs Web, account/profile switching, and CLI bridge state only if relevant. / 用虚构数据列出起始状态、操作步骤、复现频率及相关账户切换/CLI 桥接状态。"
+    validations:
+      required: true
+  -
+    type: "textarea"
+    id: "behavior"
+    attributes:
+      label: "Expected and actual results / 期望与实际结果"
+      description: "Describe expected and actual behavior, errors and last known working version; indicate whether edits/selection or data appear stale/lost. / 描述期望与实际、错误和最后正常版本；说明编辑/选择状态或数据显示是否异常。"
+    validations:
+      required: true
+  -
+    type: "textarea"
+    id: "context"
+    attributes:
+      label: "Installation or performance context (if relevant) / 安装或性能上下文（适用时）"
+      description: "Installation: package source, failing stage and sanitized error. Performance: synthetic tree/memory count, affected action, duration, CPU/memory measurement, bundled CLI background indexing/model state if known. / 安装提供失败阶段；性能提供虚构数据规模、操作、耗时、测量及相关 CLI 索引状态。"
+    validations:
+      required: false
+  -
+    type: "textarea"
+    id: "evidence"
+    attributes:
+      label: "Sanitized screenshots and diagnostics / 脱敏截图与诊断"
+      description: "Optional cropped/redacted screenshots or recording for UI issues, small logs and related issues. Hide memories, user/account names, credentials and private URLs; never upload databases. / 可附裁剪脱敏截图/录像、日志和关联问题；隐藏记忆、身份、凭据和私密 URL，勿上传数据库。"
+    validations:
+      required: false
