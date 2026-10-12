@@ -328,7 +328,7 @@ jobs:
           name: desktop-${{ matrix.name }}-${{ needs.release.outputs.client_sha }}
           path: dist/
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 1
 
   publish:
     if: github.event_name == 'push' || inputs.publish
