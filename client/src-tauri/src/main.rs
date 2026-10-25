@@ -7,6 +7,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
+use respire_client_cli_contract as cli_contract;
+use cli_contract::CliFailure;
 
 /// Canonical names win, including explicit empty values. Legacy names are read
 /// only; account and encryption migration belongs to the CLI.
@@ -81,54 +83,22 @@ fn last_nonempty_line(s: &str) -> &str {
 /// These flags affect presentation rather than subprocess output.
 /// Other platforms use the default Command behavior.
 fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
-    #[cfg_attr(not(windows), allow(unused_mut))]
-    let mut cmd = Command::new(program);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
-    }
-    cmd
+    cli_contract::hidden_command(program)
 }
 
 fn cli_output(args: &[&str]) -> Result<(bool, String, String), String> {
-    let out = hidden_command(cli_path())
-        .arg("--json")
-        .args(args)
-        .env("RSRS_JSON", "1")
-        .output()
-        .map_err(|_| {
-            "无法启动 rsrs CLI——请先安装：客户端「工作区设置 → 安装 CLI」或 npm i -g @rsrsai/cli"
-                .to_owned()
-        })?;
-    Ok((
-        out.status.success(),
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-    ))
+    let out = cli_contract::capture_json(cli_path(), args).map_err(|error| error.to_string())?;
+    Ok((out.success(), out.stdout, out.stderr))
 }
 
-/// Run the CLI in JSON mode and parse the last nonempty stdout line.
-/// Use stderr for nonzero exits and show installation guidance when the CLI cannot start.
+/// Preserve successful envelopes; nonzero/fail/pending/warn are not JSON success.
+/// Structured stdout diagnostics take precedence over stderr and never echo inputs.
 fn cli(args: &[&str]) -> Result<serde_json::Value, String> {
-    let (ok, stdout, stderr) = cli_output(args)?;
-    if !ok {
-        let msg = last_nonempty_line(&stderr);
-        return Err(if msg.is_empty() {
-            "命令执行失败".to_owned()
-        } else {
-            msg.to_owned()
-        });
-    }
-    let line = last_nonempty_line(&stdout);
-    serde_json::from_str(line).map_err(|e| {
-        format!(
-            "CLI 输出解析失败（{e}）：{}",
-            line.chars().take(200).collect::<String>()
-        )
-    })
+    let output = cli_contract::capture_json(cli_path(), args).map_err(|error| error.to_string())?;
+    let secrets: Vec<&str> = args.windows(2).filter(|pair|
+        matches!(pair[0], "--pass" | "--super" | "--secret-key" | "--token"))
+        .map(|pair| pair[1]).collect();
+    cli_contract::response(&output, &secrets).map_err(|error| error.to_string())
 }
 
 /// Serialize CLI calls to avoid contention on the database lock.
@@ -353,8 +323,8 @@ async fn register(addr: Option<String>, user: String, pass: String) -> Result<se
     cli_bg(&refs).await
 }
 
-/// Without super_pass, login uses the local keyring or environment.
-/// reset_vault explicitly abandons inaccessible remote data and requires confirmation.
+/// Current password mode needs --interactive and an explicit existing factor.
+/// Obsolete destructive/secret-key requests are rejected before spawning the CLI.
 #[tauri::command]
 async fn login(
     addr: Option<String>,
@@ -363,23 +333,24 @@ async fn login(
     super_pass: Option<String>,
     secret_key: Option<String>,
     reset_vault: Option<bool>,
-) -> Result<serde_json::Value, String> {
-    let mut args = vec!["login".to_owned(), "--user".to_owned(), user, "--pass".to_owned(), pass];
-    if let Some(a) = addr.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()) {
-        args.extend_from_slice(&["--addr".to_owned(), a]);
-    }
-    if let Some(s) = super_pass.filter(|s| !s.is_empty()) {
-        args.push("--super".to_owned());
-        args.push(s);
-    }
-    if let Some(s) = secret_key.filter(|s| !s.is_empty()) {
-        args.push("--secret-key".to_owned());
-        args.push(s);
-    }
-    if reset_vault.unwrap_or(false) {
-        args.push("--reset-vault".to_owned());
-    }
-    cli(&args.iter().map(|s| s.as_str()).collect::<Vec<&str>>())
+) -> Result<serde_json::Value, CliFailure> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LOGIN_ACTIVE: AtomicBool = AtomicBool::new(false);
+    struct Permit;
+    impl Drop for Permit { fn drop(&mut self) { LOGIN_ACTIVE.store(false, Ordering::Release); } }
+    let request = cli_contract::LoginRequest { addr, user, pass, super_pass, secret_key, reset_vault };
+    cli_contract::login_args(&request)?;
+    LOGIN_ACTIVE.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| CliFailure::new("operation_in_progress", "登录请求正在处理，请先确认本次结果。"))?;
+    let permit = Permit;
+    let gate = CLI_GATE.lock().await;
+    let program = cli_path();
+    // Keep the permit in the actual blocking task even if an invoke future drops.
+    tauri::async_runtime::spawn_blocking(move || {
+        let _permit = permit;
+        let _gate = gate;
+        cli_contract::run_login(program, &request)
+    }).await.map_err(|_| CliFailure::new("login_interrupted", "登录处理未完成，请先在宿主核对所选账号。"))?
 }
 
 #[tauri::command]
@@ -676,121 +647,23 @@ async fn doctor() -> Result<serde_json::Value, String> {
     cli_bg(&["doctor"]).await
 }
 
-/// Check reranker files in the configured user model directory.
-/// Return installation status, path, size, and optional-model metadata.
+/// Read typed CLI capabilities without probing files or installing a model.
 #[tauri::command]
-async fn rerank_model_status() -> Result<serde_json::Value, String> {
-    let dir = rerank_model_dir();
-    let tok = dir.join("tokenizer.json");
-    let onnx_q = dir.join("onnx").join("model_quantized.onnx");
-    let onnx_f = dir.join("onnx").join("model.onnx");
-    let installed = tok.is_file() && (onnx_q.is_file() || onnx_f.is_file());
-    let size_mb = if installed {
-        let a = std::fs::metadata(&onnx_q).or_else(|_| std::fs::metadata(&onnx_f));
-        a.map(|m| m.len() / 1024 / 1024).unwrap_or(0)
-    } else {
-        0
-    };
-    // The CLI applies the reranking environment switch; this response only describes installed files.
-    Ok(serde_json::json!({
-        "installed": installed,
-        "dir": dir.to_string_lossy(),
-        "size_mb": size_mb,
-        "optional": true,
-    }))
+async fn rerank_model_status() -> Result<serde_json::Value, CliFailure> {
+    let gate = CLI_GATE.lock().await;
+    let program = cli_path();
+    tauri::async_runtime::spawn_blocking(move || {
+        let _gate = gate;
+        let output = cli_contract::capture_json(program, &["capabilities"])?;
+        cli_contract::capabilities(&output)
+    }).await.map_err(|_| CliFailure::new("capability_interrupted", "能力查询未完成；不会启用精排安装。"))?
 }
 
-/// Resolve the reranker directory from explicit overrides or the user model root.
-fn rerank_model_dir() -> PathBuf {
-    if let Ok(p) = configuration_env("RSRS_RERANKER_DIR") {
-        let p = p.trim();
-        if !p.is_empty() {
-            return PathBuf::from(p);
-        }
-    }
-    if let Ok(p) = configuration_env("RSRS_MODEL_DIR") {
-        let p = p.trim();
-        if !p.is_empty() {
-            // RSRS_MODEL_DIR names the embedding model directory; use its parent as the model root.
-            let b = PathBuf::from(p);
-            if let Some(parent) = b.parent() {
-                return parent.join("bge-reranker-base");
-            }
-        }
-    }
-    let home = dirs_home();
-    home.join(".local/share/yishi/models/bge-reranker-base")
-}
-
-fn dirs_home() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/root"))
-}
-
-/// Install the optional reranker through the CLI and stream progress.
-/// Emit rerank-install://progress events for the frontend.
+/// Keep the legacy invoke fail-closed for older frontend bundles as well.
 #[tauri::command]
-async fn rerank_model_install(app: tauri::AppHandle, source: Option<String>, mirror: Option<String>) -> Result<serde_json::Value, String> {
-    use std::io::{BufRead, BufReader};
-    use tauri::Emitter;
-
-    let mut args: Vec<String> = vec!["model".into(), "install-rerank".into()];
-    // A custom source URL takes precedence over mirrors.
-    if let Some(s) = source.filter(|s| !s.trim().is_empty()) {
-        args.push("--source".into());
-        args.push(s);
-    } else {
-        // Without a custom source, resolve the mirror argument or environment override.
-        let m = mirror
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| configuration_env("RSRS_MIRROR").ok().filter(|s| !s.trim().is_empty()));
-        if let Some(m) = m {
-            args.push("--mirror".into());
-            args.push(m);
-        }
-    }
-    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-
-    let mut child = hidden_command(cli_path())
-        .arg("--json")
-        .args(&arg_refs)
-        .env("RSRS_JSON", "1")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|_| "无法启动 rsrs CLI——请先安装 CLI".to_owned())?;
-
-    // Stream stderr download progress line by line.
-    if let Some(err) = child.stderr.take() {
-        let app2 = app.clone();
-        std::thread::spawn(move || {
-            for line in BufReader::new(err).lines().map_while(Result::ok) {
-                let _ = app2.emit("rerank-install://progress", line);
-            }
-        });
-    }
-    // Read the JSON result from stdout.
-    let mut stdout = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        use std::io::Read;
-        let _ = out.read_to_string(&mut stdout);
-    }
-    let status = child.wait().map_err(|e| format!("等待安装进程失败：{e}"))?;
-    let last = last_nonempty_line(&stdout);
-    if !status.success() {
-        return Err(if last.is_empty() {
-            "安装失败（CLI 无输出）".to_owned()
-        } else {
-            last.to_owned()
-        });
-    }
-    let _ = app.emit("rerank-install://progress", "完成");
-    if last.is_empty() {
-        Ok(serde_json::json!({ "installed": true }))
-    } else {
-        serde_json::from_str(last).map_err(|e| format!("CLI 输出解析失败（{e}）"))
-    }
+async fn rerank_model_install(source: Option<String>, mirror: Option<String>) -> Result<serde_json::Value, CliFailure> {
+    let _ = (source, mirror);
+    cli_contract::retired_rerank_install()
 }
 
 #[tauri::command]
