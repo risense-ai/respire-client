@@ -51,7 +51,7 @@ function NativeMemorySearch({onClose,onSelect}){
    {loading&&<p role="status">正在搜索…</p>}
    {opening&&<p role="status">正在读取记忆…</p>}
    {error&&<p role="alert">{error}</p>}
-   {results?.map(m=><button key={m.id} disabled={opening} onClick={()=>open(m.id)}><FileText size={18}/><div><strong>{m.title}</strong><p>{m.summary}</p></div><ArrowUpRight size={14}/></button>)}
+   {results?.map(m=><button key={m.id} disabled={opening} onClick={()=>open(m.id)}><FileText size={18}/><div><strong>{m.title}</strong><p>{m.summary}</p>{(typeof m.score==='number'||m.supersededBy)&&<small className="tw-result-meta">{typeof m.score==='number'&&<span className="tw-score">相关度 {Math.round(m.score*100)}%</span>}{m.supersededBy&&<span className="tw-superseded">已被新版本取代</span>}</small>}</div><ArrowUpRight size={14}/></button>)}
    {results?.length===0&&<div className="tw-empty"><p>没有找到相关记忆</p><small>试试其他关键词或描述。</small></div>}
    {!loading&&!error&&results===null&&<div className="tw-empty"><p>输入关键词或描述，搜索本机记忆库。</p></div>}
   </div>

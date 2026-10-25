@@ -32,6 +32,33 @@ function unwrapEntry(value) {
   return null;
 }
 
+/** CLI 回执兼容：旧 CLI 直接吐条目数组，新 CLI 吐 envelope（items=标题行、details=全量条目）。
+ *  统一取数组，details 优先——它是完整条目，score/superseded_by 只在那一层才有。 */
+export function unwrapRows(value) {
+  if (Array.isArray(value)) return value;
+  if (value && typeof value === 'object') {
+    if (Array.isArray(value.details) && value.details.length) return value.details;
+    if (Array.isArray(value.items) && value.items.length) return value.items;
+  }
+  return [];
+}
+
+function pickMeta(value) {
+  return value && typeof value === 'object' ? value : {};
+}
+
+function pickScore(outer, row) {
+  const a = pickMeta(outer).score;
+  const b = pickMeta(row).score;
+  return typeof a === 'number' ? a : (typeof b === 'number' ? b : null);
+}
+
+function pickSupersededBy(outer, row) {
+  const a = pickMeta(outer).superseded_by;
+  const b = pickMeta(row).superseded_by;
+  return typeof a === 'string' && a ? a : (typeof b === 'string' && b ? b : null);
+}
+
 /** Normalize array and legacy CSV tags to an array before rendering or searching. */
 function toTagList(tags) {
   if (Array.isArray(tags)) return tags.filter(t => typeof t === 'string' && t.trim()).map(t => t.trim());
@@ -60,24 +87,27 @@ export function toMemory(e) {
     parentId: parent || null,
     relatedIds: [],
     importance: row.importance || 'normal',
+    // recall 回执才有的归因字段：检索相关度与取代关系，展示"为什么排这里"。
+    score: pickScore(e, row),
+    supersededBy: pickSupersededBy(e, row),
   };
 }
 
 export async function boot() {
   if (!isNative) return null;
-  const list = await call('list', { limit: 100000 });
-  if (!Array.isArray(list)) throw new Error('list 返回不是数组');
+  const list = unwrapRows(await call('list', { limit: 100000 }));
   return list.map(toMemory).filter(Boolean);
 }
 
 export async function searchMemories(query) {
-  const results = await call('search', { q: query, limit: 20 });
-  if (!Array.isArray(results)) throw new Error('搜索返回不是数组');
-  return results.map(toMemory).filter(Boolean);
+  const rows = unwrapRows(await call('search', { q: query, limit: 20 }));
+  return rows.map(toMemory).filter(Boolean);
 }
 
 export async function readMemory(id) {
-  const memory = toMemory(await call('show', { id }));
+  const raw = await call('show', { id });
+  const row = unwrapEntry(raw?.entry ? raw : raw?.details?.entry ? raw.details : raw);
+  const memory = toMemory(row);
   if (!memory?.id || memory.id !== id) throw new Error('读取未返回对应记忆');
   return memory;
 }
