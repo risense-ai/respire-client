@@ -8,6 +8,7 @@ import {scopePath,scopeDigest,captureScope,enrichGrants,grantsForNode,moveImpact
 import DiaryCalendar from './DiaryCalendar.jsx';
 import {boot as bridgeBoot, isNative, createMemory, updateMemory, deleteMemory, restoreMemory, attachMemory, searchMemories, readMemory, purgeMemory} from './bridge.js';
 import {parseBackup} from './backup.js';
+import {RECOVERY_HELP,capabilityView,loginOutcome,registrationOutcome,safeAccountError,createAccountRequestGate} from './accountContract.js';
 const inv=(cmd,args={})=>{const f=window.__TAURI__?.core?.invoke;return f?f(cmd,args):Promise.reject(new Error("非本地客户端（未连 Tauri）"))};
 const NATIVE=isNative;
 import TreeSidebar from './TreeSidebar.jsx';
@@ -251,18 +252,10 @@ function WorkspaceConfig({notify,onOpenGate,bridged,statusInfo,onSessionChange,s
  const doctorRow=doctorInfo?(<div className="tw-preference-row"><div><strong>自检</strong><span>{doctorInfo.items.map(it=>`${it.ok?'✅':'❌'}${it.item}`).join('　')}</span></div><span className={'sv-state '+(doctorInfo.all_ok?'sv-state-current':'sv-state-pending')}>{doctorInfo.all_ok?'全部通过':'有异常'}</span></div>)
    :<div className="tw-preference-row" title="模型 / 库 / 锁 / 远程 / 注入 / 作用域，一站式体检。"><div><strong>自检</strong></div><button className="button" onClick={runDoctor}>运行 doctor</button></div>;
  const row=(label,desc,node)=>(<div className="tw-preference-row" title={typeof desc==='string'?desc:undefined}><div><strong>{label}</strong></div>{node}</div>);
- // The optional cross-encoder reranker is separate from the bundled embedding model.
- const [rk,setRk]=useState(null);const [rkBusy,setRkBusy]=useState(false);const [rkMsg,setRkMsg]=useState('');
- useEffect(()=>{(async()=>{if(!NATIVE)return;try{setRk(await inv2('rerank_model_status'))}catch{}})()},[]);
- useEffect(()=>{if(!NATIVE||!window.__TAURI__?.event)return;
-   let un;try{un=window.__TAURI__.event.listen('rerank-install://progress',e=>setRkMsg(String(e.payload||'')))}catch{}
-   return()=>{try{un&&un()}catch{}}},[]);
- const installRerank=async()=>{
-   if(rkBusy)return;setRkBusy(true);setRkMsg('准备下载…');
-   try{const r=await inv2('rerank_model_install');setRk(await inv2('rerank_model_status'));notify(r&&r.skipped?'精排模型已存在，未重复下载':'精排模型安装完成 · recall 将启用精排')}
-   catch(e){notify('安装失败：'+e)}
-   finally{setRkBusy(false);setRkMsg('')}};
- const rerankRow=(<div className="tw-preference-row"><div><strong>精排模型（可选）</strong><span>{rk?(rk.installed?`已安装 · ${rk.size_mb}MB · recall 自动启用 cross-encoder 精排`:'未安装——装后可显著减少「词面相近而语义无关」的误召回'):'读取中…'}{rkBusy&&rkMsg?` · ${rkMsg}`:''}</span></div>{rk&&!rk.installed?<button className="button" disabled={rkBusy||!NATIVE} onClick={installRerank}>{rkBusy?'下载中…':'安装（约 280MB）'}</button>:<span className={'sv-state '+(rk&&rk.installed?'sv-state-current':'sv-state-pending')}>{rk&&rk.installed?'已就绪':'未安装'}</span>}</div>);
+ // Read typed capabilities; retired/unknown never offer installation.
+ const [rk,setRk]=useState({state:'loading'});
+ useEffect(()=>{let active=true;if(NATIVE)inv2('rerank_model_status').then(value=>{if(active)setRk(capabilityView(value))}).catch(()=>{if(active)setRk({state:'unknown',message:'无法确认 CLI 能力，请更新 CLI；不会启用精排安装。'})});return()=>{active=false}},[]);
+ const rerankRow=!NATIVE||rk.state==='retired'?null:(<div className="tw-preference-row"><div><strong>CLI 能力</strong><span>{rk.state==='loading'?'正在查询 CLI 能力…':rk.message}</span></div></div>);
  // Vault v4 key maintenance resets the super password without changing data and exports recovery material.
  const [keyBusy,setKeyBusy]=useState(false);const [keyMsg,setKeyMsg]=useState('');const [exported,setExported]=useState('');
  const [newSuperKey,setNewSuperKey]=useState('');
@@ -392,60 +385,57 @@ function SuperKeyReveal({title,superKey,onDone,doneLabel='我已抄录保存'}){
  </div>;
 }
 
-function AccountGate({notify,onDone,bootError}){
+export function AccountGate({notify,onDone,bootError}){
  const inv2=(c,a={})=>{const f=window.__TAURI__?.core?.invoke;return f?f(c,a):Promise.reject(new Error("非本地客户端（未连 Tauri）"))};
+ const request=useRef(createAccountRequestGate());
  const [mode,setMode]=useState('login');
  const [f,setF]=useState({addr:'https://api.rsrs.rs',user:'',pass:'',confirm:'',super:''});
  const [busy,setBusy]=useState(false);
  const [formError,setFormError]=useState('');
  const [hold,setHold]=useState(null);
- const [resetNeeded,setResetNeeded]=useState(false);
- const [hideSuper,setHideSuper]=useState(false);
  const [preparing,setPreparing]=useState(true);
- const set=k=>e=>setF(o=>({...o,[k]:e.target.value}));
+ const clearSecrets=()=>setF(o=>({...o,pass:'',confirm:'',super:''}));
+ const set=k=>e=>{if(!request.current.busy&&!hold)setF(o=>({...o,[k]:e.target.value}))};
  useEffect(()=>{
-  let dead=false;
-  (async()=>{
-   try{
-    const r=await inv2('resume_session');
-    if(dead)return;
-    const addr=(r&&r.addr)||'https://api.rsrs.rs';
-    setF(o=>({...o,addr,user:(r&&r.user)||o.user}));
-    if(r&&r.has_super)setHideSuper(true);
-    if(r&&r.error)setFormError(String(r.error).slice(0,400));
-    if(r&&r.super_issued){setHold({kind:'issued',super:r.super_issued});setPreparing(false);return}
-    if(r&&r.resumed){notify('已用本机会话进入');onDone();return}
-   }catch{}
-   try{
-    const s=await inv2('server_addr_get');
-    if(!dead&&s&&s.addr)setF(o=>({...o,addr:s.addr}));
-   }catch{}
-   if(!dead)setPreparing(false);
-  })();
-  return()=>{dead=true};
+  const gate=createAccountRequestGate();request.current=gate;let active=true;
+  inv2('server_addr_get').then(value=>{if(active&&value?.addr)setF(o=>({...o,addr:value.addr}))}).catch(()=>{}).finally(()=>{if(active)setPreparing(false)});
+  return()=>{active=false;gate.dispose()};
  },[]);
  const fail=msg=>{setFormError(msg);notify(msg)};
- const doLogin=async resetVault=>{
-  const r=await inv2('login',{addr:f.addr.trim(),user:f.user.trim(),pass:f.pass,superPass:f.super||null,resetVault});
-  if(r&&r.ok===false)throw new Error(r.error||r.message||'登录失败');
-  // When vault migration issues a super password, display it for the user to save.
-  if(r&&r.super_issued)setHold({kind:'issued',super:r.super_issued});
-  else{notify('登录成功');onDone()}
+ const close=()=>{
+  if(request.current.busy){notify('登录请求处理中，请先确认本次结果。');return}
+  if(hold){notify('请先确认已保存恢复材料。');return}
+  clearSecrets();request.current.close();onDone();
+ };
+ const acknowledge=()=>{clearSecrets();setHold(null);request.current.close();onDone()};
+ const doLogin=async ticket=>{
+  const params={addr:f.addr.trim(),user:f.user.trim(),pass:f.pass,superPass:f.super||null};
+  try{
+   const pending=inv2('login',params);clearSecrets();
+   const value=await pending;if(!request.current.current(ticket))return;
+   const outcome=loginOutcome(value);
+   if(outcome.kind==='issued')setHold({kind:'issued',super:outcome.superIssued});
+   else if(outcome.kind==='warning'){
+    fail(outcome.message);if(outcome.superIssued)setHold({kind:'issued',super:outcome.superIssued});
+   }else{notify('登录成功');onDone()}
+  }finally{params.pass='';params.superPass=null}
  };
  const submit=async e=>{
-  e.preventDefault();if(busy||hold)return;setBusy(true);setFormError('');setResetNeeded(false);
+  e.preventDefault();if(hold)return;const ticket=request.current.begin();if(ticket===null)return;setBusy(true);setFormError('');
+  const privateInputs=[f.pass,f.super];
   try{
    if(mode==='login'){
     if(!f.pass)throw new Error('请填登录密码');
-    await doLogin(false);
+    if(!f.super.trim())throw new Error(RECOVERY_HELP);
+    await doLogin(ticket);
    }else if(mode==='register'){
     if(f.pass.length<8)throw new Error('登录密码至少 8 位');
     if(f.pass!==f.confirm)throw new Error('两次登录密码不一致');
     // Vault v4 registration generates the super password instead of accepting it as input.
     const r=await inv2('register',{addr:f.addr.trim(),user:f.user.trim(),pass:f.pass});
-    if(r&&r.ok===false)throw new Error(r.error||r.message||'注册失败');
-    if(!r||!r.super)throw new Error('注册未返回超级密码——请升级 CLI 后重试');
-    setHold({kind:'register',user:(r&&r.user)||f.user.trim(),super:r.super});
+    if(!request.current.current(ticket))return;
+    const outcome=registrationOutcome(r);
+    setHold({kind:'register',user:outcome.user||f.user.trim(),super:outcome.superIssued});
    }else{
     // Offline setup stores generated local keys in the system keyring.
     // The CLI rejects overwriting cloud key material without explicit confirmation.
@@ -463,29 +453,26 @@ function AccountGate({notify,onDone,bootError}){
     }
    }
   }catch(err){
-   const msg=errText(err).slice(0,400);
-   // Require explicit data-reset confirmation when remote data exists without a usable local vault wrapper.
-   if(mode==='login'&&/reset-vault|放弃旧数据|覆盖保护/.test(msg))setResetNeeded(true);
-   fail(msg);
+   if(request.current.current(ticket))fail(safeAccountError(err,privateInputs));
+  }finally{
+   privateInputs.fill('');if(request.current.finish(ticket)){clearSecrets();setBusy(false)}
   }
-  setBusy(false);
  };
  const tabs=[['login','登录'],['register','注册'],['keygen','离线本机']];
- return <Modal title="接入记忆库" onClose={()=>{if(!busy)onDone()}} wide>
+ return <Modal title="接入记忆库" onClose={close} wide>
   {bootError&&<p className="tw-demo-note" style={{color:'#b0574f'}}>未连上本地记忆库：{bootError}——请先「工作区设置 → 安装 CLI」或升级 CLI 后重试。</p>}
   {formError&&<p role="alert" className="tw-demo-note" style={{color:'#b0574f'}}>{formError}</p>}
-  {resetNeeded&&f.pass&&<div className="tw-permission-notice" style={{background:'#fff5f5'}}><WarningCircle size={16}/><div><p>服务器已有该账号的数据，但本机没有对应的钥匙包裹（换机或旧钥匙已失？）。</p><button className="button" type="button" disabled={busy} onClick={async()=>{if(!confirm('确认放弃云端旧数据、以本机新钥匙为起点？旧密文将永久无法解开。'))return;setBusy(true);setFormError('');try{await doLogin(true)}catch(e){fail(errText(e).slice(0,400))}setBusy(false)}}>以本机新钥匙为起点（放弃旧数据）</button></div></div>}
-  {hold?.kind==='register'&&<SuperKeyReveal title={`注册成功：${hold.user||''}。立刻抄录超级密码——这是解开记忆的唯一钥匙，服务器没有备份。`} superKey={hold.super} onDone={onDone}/>}
-  {hold?.kind==='issued'&&<SuperKeyReveal title="本机账号已升级 v4 单因子密钥：这是超级密码（旧口令退出加密域），立刻抄录。" superKey={hold.super} onDone={onDone} doneLabel="我已抄录，进入记忆库"/>}
+  {hold?.kind==='register'&&<SuperKeyReveal title={`注册成功：${hold.user||''}。立刻抄录超级密码——这是解开记忆的唯一钥匙，服务器没有备份。`} superKey={hold.super} onDone={acknowledge}/>}
+  {hold?.kind==='issued'&&<SuperKeyReveal title="本机账号已升级 v4 单因子密钥：这是超级密码（旧口令退出加密域），立刻抄录。" superKey={hold.super} onDone={acknowledge} doneLabel="我已抄录，进入记忆库"/>}
   {preparing&&!hold&&<p className="tw-demo-note">正在从本机会话和系统密钥环接入…</p>}
   {!hold&&!preparing&&<>
-  <div className="view-tabs" style={{marginBottom:12}}>{tabs.map(([k,l])=><button key={k} type="button" className={mode===k?'active':''} disabled={busy} onClick={()=>{setMode(k);setFormError('');setResetNeeded(false)}}>{l}</button>)}</div>
+  <div className="view-tabs" style={{marginBottom:12}}>{tabs.map(([k,l])=><button key={k} type="button" className={mode===k?'active':''} disabled={busy} onClick={()=>{if(!request.current.busy){clearSecrets();setMode(k);setFormError('')}}}>{l}</button>)}</div>
   <form onSubmit={submit}>
    {mode!=='keygen'&&<label>服务器地址<input required value={f.addr} onChange={set('addr')} disabled={busy}/></label>}
    {mode!=='keygen'&&<label>用户名<input required value={f.user} onChange={set('user')} disabled={busy}/></label>}
    {mode==='login'&&<><label>登录密码<input required type="password" value={f.pass} onChange={set('pass')} disabled={busy}/></label>
-    {!hideSuper&&<label>超级密码（解密用；本机密钥环已有则留空）<input type="password" value={f.super} onChange={set('super')} disabled={busy}/></label>}
-    <p className="tw-demo-note">{hideSuper?'超级密码已从系统密钥环读取，不用再填。登录密码只在这台机器还没存过时要填一次，之后也从密钥环取。':'新设备：填登录密码 + 超级密码即可接续（超级密码丢了就无法解开云上记忆）。'}</p></>}
+    <label>原 A3 恢复码（解锁同一云端库）<input type="password" autoComplete="off" value={f.super} onChange={set('super')} disabled={busy}/></label>
+    <p className="tw-demo-note">{RECOVERY_HELP} 桌面密码模式不支持 TOTP 提示；--interactive 不会创建终端。</p></>}
    {mode==='register'&&<><label>登录密码（进服务器用，可重置；至少 8 位）<input required type="password" value={f.pass} onChange={set('pass')} disabled={busy}/></label>
     <label>再次输入登录密码<input required type="password" value={f.confirm} onChange={set('confirm')} disabled={busy}/></label>
     <p className="tw-demo-note">超级密码由系统生成（A3- 恢复码），注册完成后立刻抄录。登录密码进服务器，超级密码解记忆，二者分工。</p></>}
