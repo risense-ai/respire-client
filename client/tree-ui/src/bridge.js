@@ -124,9 +124,10 @@ export async function createMemory({ title, content, type, tags, parent, importa
   if (importance) args.importance = importance;
   const created = await call('create', args);
   if (created?.status === 'candidates') throw new Error('未写入：存在相似候选');
-  const memory = toMemory(created);
-  if (!memory?.id) throw new Error('创建未返回记忆 ID');
-  return memory;
+  const id = created?.id || created?.summary?.id || created?.entry?.id;
+  if (!id) throw new Error('创建未返回记忆 ID');
+  // A normalized write receipt carries only the result fields; read the entry back for its body.
+  return readMemory(id);
 }
 
 export async function updateMemory(id, { title, content, type, tags, importance }) {
@@ -159,7 +160,10 @@ export async function attachMemory(id, parent) {
 }
 
 export async function restoreMemory(id) {
-  const memory = toMemory(await call('restore', { id }));
+  const restored = await call('restore', { id });
+  if (restored?.restored === false) throw new Error('未恢复');
+  // Same as create: the receipt has the id, the body comes from a follow-up read.
+  const memory = await readMemory(id);
   if (!memory?.id || memory.id !== id) throw new Error('恢复未返回对应记忆');
   return memory;
 }
