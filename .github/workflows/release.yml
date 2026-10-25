@@ -5,6 +5,14 @@ name: Release
 
 on:
   push:
+    paths-ignore:
+      - '.github/scripts/cleanup_artifacts.py'
+      - '.github/scripts/test_cleanup_artifacts.py'
+      - '.github/cleanup-policy.json'
+      - '.github/workflows/cleanup-artifacts.yml'
+      - '.github/workflows/cleanup-policy-tests.yml'
+      - '.github/workflows/release.yml'
+      - 'docs/artifact-cleanup.md'
     branches: [main]
     tags: ["v*"]
   workflow_dispatch:
@@ -325,10 +333,10 @@ jobs:
           (cd dist && sha256sum * > SHA256SUMS)
       - uses: actions/upload-artifact@v4
         with:
+          retention-days: 1
           name: desktop-${{ matrix.name }}-${{ needs.release.outputs.client_sha }}
           path: dist/
           if-no-files-found: error
-          retention-days: 14
 
   publish:
     if: github.event_name == 'push' || inputs.publish
@@ -368,34 +376,28 @@ jobs:
           if [ "$CHANNEL" = dev ]; then ARGS=(--target "$CLIENT_SHA" --prerelease); fi
           gh release create "$TAG" release-assets/* --repo "$GITHUB_REPOSITORY" \
             "${ARGS[@]}" --title "$TAG" --notes-file release-assets/BUILD-SOURCES.txt
-          echo "Installers published in $GITHUB_REPOSITORY. Cross-repository mirroring requires RELEASES_GITHUB_TOKEN." >> "$GITHUB_STEP_SUMMARY"
-  mirror:
-    if: github.event_name == 'push' || inputs.publish
-    needs: [release, publish]
+          echo "Installers published in $GITHUB_REPOSITORY. Legacy cross-repository mirroring is retired." >> "$GITHUB_STEP_SUMMARY"
+  cleanup-receipt:
+    needs: [release, client, publish]
+    if: ${{ always() && !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && github.event_name != 'pull_request' && (github.event_name == 'push' || inputs.publish) }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
+      actions: read
     steps:
-      - name: Mirror only when cross-repository publication is configured
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Record the completed producer and delivery inventory
         env:
           GH_TOKEN: ${{ github.token }}
-          MIRROR_TOKEN: ${{ secrets.RELEASES_GITHUB_TOKEN }}
-          TAG: ${{ needs.release.outputs.tag }}
-          CHANNEL: ${{ needs.release.outputs.channel }}
-        run: |
-          set -euo pipefail
-          if [ -z "$MIRROR_TOKEN" ]; then
-            echo "::warning::RELEASES_GITHUB_TOKEN is not configured; installers are available in $GITHUB_REPOSITORY, not mirrored to respire-releases."
-            echo "Mirror not configured. Download from https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir mirror-assets
-          ARGS=()
-          if [ "$CHANNEL" = dev ]; then ARGS=(--prerelease); fi
-          mv mirror-assets/SHA256SUMS mirror-assets/DESKTOP-SHA256SUMS
-          if GH_TOKEN="$MIRROR_TOKEN" gh release view "$TAG" --repo risense-ai/respire-releases > /dev/null 2>&1; then
-            GH_TOKEN="$MIRROR_TOKEN" gh release upload "$TAG" mirror-assets/* --repo risense-ai/respire-releases --clobber
-          else
-            GH_TOKEN="$MIRROR_TOKEN" gh release create "$TAG" mirror-assets/* --repo risense-ai/respire-releases \
-              "${ARGS[@]}" --title "$TAG" --notes-file mirror-assets/BUILD-SOURCES.txt
-          fi
+          CLEANUP_RELEASE_TAG: ${{ needs.release.outputs.tag }}
+          CLEANUP_SOURCE_SHA: ${{ needs.release.outputs.client_sha }}
+        run: python3 .github/scripts/cleanup_artifacts.py stamp
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cleanup-ready-v1
+          path: ${{ runner.temp }}/cleanup-ready.json
+          retention-days: 1
+          if-no-files-found: ignore

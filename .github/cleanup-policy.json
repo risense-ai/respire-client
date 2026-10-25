@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "repository": "risense-ai/respire-client",
+  "workflows": {
+    ".github/workflows/release.yml": {
+      "mode": "release",
+      "artifacts": [
+        "desktop-(?:windows-x64-nsis|windows-arm64-nsis|mac-arm64-dmg|linux-x64|linux-arm64)-[0-9a-f]{40}"
+      ],
+      "consumer_workflows": []
+    }
+  }
+}
