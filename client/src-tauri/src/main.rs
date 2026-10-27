@@ -1,5 +1,7 @@
 //! The desktop shell translates frontend invokes into rsrs CLI subprocess calls.
-//! Return stdout JSON unchanged. CLI hosts storage and resources; private memory
+//! CLI output is an envelope {command,status,summary,items,actions,errors,details};
+//! this shell unwraps it into the payload the UI asks for, so the frontend never
+//! has to know the envelope. CLI hosts storage and resources; private memory
 //! policies and inference stay in its binary Core dependency.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -110,11 +112,32 @@ fn cli_output(args: &[&str]) -> Result<(bool, String, String), String> {
     ))
 }
 
-/// Run the CLI in JSON mode and parse the last nonempty stdout line.
-/// Use stderr for nonzero exits and show installation guidance when the CLI cannot start.
+/// Run the CLI in JSON mode, unwrap the envelope, and surface failures as errors.
+/// Failure details often live only in the stdout envelope while stderr stays empty,
+/// so the human message is read from there before falling back to stderr.
 fn cli(args: &[&str]) -> Result<serde_json::Value, String> {
     let (ok, stdout, stderr) = cli_output(args)?;
+    let line = last_nonempty_line(&stdout);
+    let parsed = match serde_json::from_str::<serde_json::Value>(line) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            if ok {
+                return Err(format!(
+                    "CLI 输出解析失败（{e}）：{}",
+                    line.chars().take(200).collect::<String>()
+                ));
+            }
+            None
+        }
+    };
     if !ok {
+        if let Some(v) = parsed {
+            if is_envelope(&v) {
+                // normalize turns a failed envelope into an error message,
+                // except for report commands whose failures are the result.
+                return normalize_cli_payload(v);
+            }
+        }
         let msg = last_nonempty_line(&stderr);
         return Err(if msg.is_empty() {
             "命令执行失败".to_owned()
@@ -122,13 +145,119 @@ fn cli(args: &[&str]) -> Result<serde_json::Value, String> {
             msg.to_owned()
         });
     }
-    let line = last_nonempty_line(&stdout);
-    serde_json::from_str(line).map_err(|e| {
-        format!(
-            "CLI 输出解析失败（{e}）：{}",
-            line.chars().take(200).collect::<String>()
-        )
-    })
+    normalize_cli_payload(parsed.unwrap_or(serde_json::Value::Null))
+}
+
+/// A CLI envelope carries a command name, a status, and one of the payload columns.
+fn is_envelope(v: &serde_json::Value) -> bool {
+    v.get("command").and_then(|c| c.as_str()).is_some()
+        && v.get("status").and_then(|s| s.as_str()).is_some()
+        && ["items", "details", "errors", "summary"]
+            .iter()
+            .any(|k| v.get(*k).is_some())
+}
+
+fn envelope_command(v: &serde_json::Value) -> &str {
+    v.get("command").and_then(|c| c.as_str()).unwrap_or("")
+}
+
+/// Doctor prints a health report whose failures are the result, not an error condition.
+fn is_report_command(command: &str) -> bool {
+    matches!(command, "doctor")
+}
+
+/// One human-readable line for a failed envelope: the first error text wins,
+/// then the first failing item, then the failure reason. Clap usage text is multiline.
+fn envelope_message(v: &serde_json::Value) -> Option<String> {
+    if let Some(errors) = v.get("errors").and_then(|e| e.as_array()) {
+        let first = errors
+            .iter()
+            .filter_map(|e| e.as_str())
+            .map(str::trim)
+            .find(|s| !s.is_empty());
+        if let Some(first) = first {
+            return Some(first.lines().next().unwrap_or(first).trim().to_owned());
+        }
+    }
+    if let Some(items) = v.get("items").and_then(|i| i.as_array()) {
+        let failed = items.iter().find(|i| {
+            matches!(
+                i.get("status").and_then(|s| s.as_str()),
+                Some("fail" | "error")
+            )
+        });
+        if let Some(value) = failed
+            .and_then(|i| i.get("value"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(value.to_owned());
+        }
+    }
+    let reason = v
+        .get("summary")
+        .and_then(|s| s.get("reason"))
+        .and_then(|r| r.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    reason.map(|r| format!("命令失败（{r}）"))
+}
+
+/// Unwrap an envelope into the payload the UI consumes. A bare array or object
+/// from an older CLI passes through unchanged.
+///
+/// - `details` arrays hold whole rows (list/recall/tree/inject targets); their
+///   per-row attribution such as score and superseded_by survives intact.
+/// - `details` objects hold one result (show's entry set, space's spaces,
+///   defrag's clusters) and merge over `summary`.
+/// - `items` are title rows only; their values fill keys `summary` does not set,
+///   and the row array stays available as `items`. Summary keeps its typed values.
+/// - A `fail` status becomes an error, except for report commands.
+fn normalize_cli_payload(v: serde_json::Value) -> Result<serde_json::Value, String> {
+    if !is_envelope(&v) {
+        return Ok(v);
+    }
+    if v.get("status").and_then(|s| s.as_str()) == Some("fail")
+        && !is_report_command(envelope_command(&v))
+    {
+        return Err(envelope_message(&v).unwrap_or_else(|| "命令执行失败".to_owned()));
+    }
+    let summary = v
+        .get("summary")
+        .filter(|s| s.is_object())
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let mut merged = summary.as_object().cloned().unwrap_or_default();
+    let details = v.get("details");
+    if let Some(rows) = details.and_then(|d| d.as_array()).filter(|r| !r.is_empty()) {
+        return Ok(serde_json::Value::Array(rows.clone()));
+    }
+    if let Some(map) = details.and_then(|d| d.as_object()).filter(|m| !m.is_empty()) {
+        for (key, value) in map {
+            merged.insert(key.clone(), value.clone());
+        }
+        return Ok(serde_json::Value::Object(merged));
+    }
+    if let Some(items) = v.get("items").and_then(|i| i.as_array()).filter(|i| !i.is_empty()) {
+        for item in items {
+            let name = item.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            if name.is_empty() || merged.contains_key(name) {
+                continue;
+            }
+            merged.insert(
+                name.to_owned(),
+                item.get("value").cloned().unwrap_or(serde_json::Value::Null),
+            );
+        }
+        if !merged.contains_key("items") {
+            merged.insert("items".to_owned(), serde_json::Value::Array(items.clone()));
+        }
+    }
+    if merged.is_empty() {
+        return Ok(v);
+    }
+    Ok(serde_json::Value::Object(merged))
 }
 
 /// Serialize CLI calls to avoid contention on the database lock.
@@ -288,6 +417,7 @@ async fn update(
     content: Option<String>,
     tags: Option<String>,
     kind: Option<String>,
+    importance: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let mut args: Vec<String> = vec!["update".into(), id];
     if let Some(v) = title {
@@ -301,6 +431,9 @@ async fn update(
     }
     if let Some(v) = kind {
         args.extend(["--kind".into(), v]);
+    }
+    if let Some(v) = importance.filter(|s| !s.is_empty()) {
+        args.extend(["--importance".into(), v]);
     }
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     cli(&refs)
@@ -354,15 +487,13 @@ async fn register(addr: Option<String>, user: String, pass: String) -> Result<se
 }
 
 /// Without super_pass, login uses the local keyring or environment.
-/// reset_vault explicitly abandons inaccessible remote data and requires confirmation.
+/// The CLI dropped --secret-key and --reset-vault; only its current flags are sent.
 #[tauri::command]
 async fn login(
     addr: Option<String>,
     user: String,
     pass: String,
     super_pass: Option<String>,
-    secret_key: Option<String>,
-    reset_vault: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let mut args = vec!["login".to_owned(), "--user".to_owned(), user, "--pass".to_owned(), pass];
     if let Some(a) = addr.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()) {
@@ -372,14 +503,30 @@ async fn login(
         args.push("--super".to_owned());
         args.push(s);
     }
-    if let Some(s) = secret_key.filter(|s| !s.is_empty()) {
-        args.push("--secret-key".to_owned());
-        args.push(s);
-    }
-    if reset_vault.unwrap_or(false) {
-        args.push("--reset-vault".to_owned());
-    }
     cli(&args.iter().map(|s| s.as_str()).collect::<Vec<&str>>())
+}
+
+/// Report the account this machine already holds so the gate can skip re-entry.
+/// The CLI's status envelope carries the session identity and local key state.
+#[tauri::command]
+async fn resume_session() -> Result<serde_json::Value, String> {
+    let v = cli_bg(&["status"]).await?;
+    let session = v.get("session").cloned().unwrap_or_else(|| serde_json::json!({}));
+    let has_session = session
+        .get("has_session")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
+    let has_super = session
+        .get("has_local_keys")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
+    Ok(serde_json::json!({
+        "addr": v.get("server_addr").cloned().unwrap_or(serde_json::json!("")),
+        "user": session.get("user").cloned().unwrap_or(serde_json::json!("")),
+        "has_session": has_session,
+        "has_super": has_super,
+        "resumed": has_session && has_super,
+    }))
 }
 
 #[tauri::command]
@@ -400,7 +547,7 @@ async fn logout(full: bool) -> Result<serde_json::Value, String> {
     }
     let line = last_nonempty_line(&stdout);
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-        return Ok(v);
+        return normalize_cli_payload(v);
     }
     Ok(serde_json::json!({ "ok": true, "full": full }))
 }
@@ -487,9 +634,35 @@ async fn diary_mode_get() -> Result<serde_json::Value, String> {
     }))
 }
 
+/// The workspace behavior switches (readonly and friends) live in the same agent.json.
+#[tauri::command]
+async fn agent_config() -> Result<serde_json::Value, String> {
+    cli_bg(&["agent-config"]).await
+}
+
+/// Workspace mode is an agent.json key with a fixed value set (normal | readonly | off).
+#[tauri::command]
+async fn workspace_mode_get() -> Result<serde_json::Value, String> {
+    let v = cli_bg(&["agent-config"]).await?;
+    Ok(serde_json::json!({
+        "mode": v.get("workspace_mode").cloned().unwrap_or(serde_json::json!("normal")),
+    }))
+}
+
+#[tauri::command]
+async fn workspace_mode_set(mode: String) -> Result<serde_json::Value, String> {
+    cli_bg(&["agent-config", "--set", &format!("workspace_mode={mode}")]).await
+}
+
 #[tauri::command]
 async fn diary_mode_set(mode: String) -> Result<serde_json::Value, String> {
     cli_bg(&["agent-config", "--set", &format!("diary_mode={mode}")]).await
+}
+
+/// Check the npm registry through the CLI; the shell only unwraps the envelope.
+#[tauri::command]
+async fn update_check() -> Result<serde_json::Value, String> {
+    cli_bg(&["update-check"]).await
 }
 
 #[tauri::command]
@@ -676,6 +849,23 @@ async fn doctor() -> Result<serde_json::Value, String> {
     cli_bg(&["doctor"]).await
 }
 
+/// Probe the CLI once per process for rerank support. The reranker subcommand was
+/// removed upstream, so the UI must not offer an install button that cannot work.
+fn cli_supports_rerank() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        hidden_command(cli_path())
+            .args(["model", "--help"])
+            .output()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .to_lowercase()
+                    .contains("rerank")
+            })
+            .unwrap_or(false)
+    })
+}
+
 /// Check reranker files in the configured user model directory.
 /// Return installation status, path, size, and optional-model metadata.
 #[tauri::command]
@@ -697,6 +887,7 @@ async fn rerank_model_status() -> Result<serde_json::Value, String> {
         "dir": dir.to_string_lossy(),
         "size_mb": size_mb,
         "optional": true,
+        "supported": cli_supports_rerank(),
     }))
 }
 
@@ -1199,10 +1390,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             candidates, create, update, delete, purge, restore, attach, promote,
             sync,
             logout,
-            register, login, keygen,
+            register, login, resume_session, keygen,
             super_reset, keys_export, list_system_fonts,
             config_get, server_addr_get, server_addr_set, sync_config_set, cure_config_set,
-            diary_mode_get, diary_mode_set,
+            agent_config, diary_mode_get, diary_mode_set, update_check,
+            workspace_mode_get, workspace_mode_set,
             data_dir_set, scope_material,
             space_list, space_create, space_use, space_invite, space_join, space_members, space_kick, space_remove,
             cli_install, inject_targets, inject, inject_remove, inject_preview, inject_apply, doctor,
@@ -1213,4 +1405,160 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ])
         .run(tauri::generate_context!())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod envelope_tests {
+    use super::{envelope_message, normalize_cli_payload};
+    use serde_json::json;
+
+    /// Envelope samples below are verbatim captures of `rsrs --json` output
+    /// (CLI 1.0.16), so the unwrap rules stay pinned to the real contract.
+
+    #[test]
+    fn list_details_rows_become_the_entry_array() {
+        let out = normalize_cli_payload(json!({
+            "command": "list", "status": "ok",
+            "summary": {"count": 1, "limit": 1},
+            "items": [{"name": "753da84d", "status": "ok", "value": "活动轨迹 2026-10-25"}],
+            "details": [{"id": "753da84d-0000", "content": "probe", "kind": "Context"}],
+        }))
+        .expect("list payload");
+        assert_eq!(out.as_array().expect("rows").len(), 1);
+        assert_eq!(out[0]["id"], "753da84d-0000");
+    }
+
+    #[test]
+    fn recall_rows_keep_score_and_supersession() {
+        let out = normalize_cli_payload(json!({
+            "command": "recall", "status": "ok",
+            "summary": {"count": 1, "recall_mode": "fast"},
+            "items": [{"name": "753da84d", "status": "ok", "value": "0.620 活动轨迹"}],
+            "details": [{"score": 0.62, "superseded_by": "ffff0000",
+                         "entry": {"id": "753da84d-0000", "content": "probe"}}],
+        }))
+        .expect("recall payload");
+        assert_eq!(out[0]["score"], 0.62);
+        assert_eq!(out[0]["superseded_by"], "ffff0000");
+        assert_eq!(out[0]["entry"]["id"], "753da84d-0000");
+    }
+
+    #[test]
+    fn show_details_object_merges_over_summary() {
+        let out = normalize_cli_payload(json!({
+            "command": "show", "status": "ok",
+            "summary": {"id": "753da84d-0000", "title": "活动轨迹 2026-10-25"},
+            "items": [{"name": "entry", "status": "ok", "value": "753da84d"}],
+            "details": {"ancestors": [], "children": [], "entry": {"id": "753da84d-0000"}},
+        }))
+        .expect("show payload");
+        assert_eq!(out["id"], "753da84d-0000");
+        assert_eq!(out["entry"]["id"], "753da84d-0000");
+        assert!(out["ancestors"].is_array());
+    }
+
+    #[test]
+    fn write_receipt_without_details_returns_summary() {
+        let out = normalize_cli_payload(json!({
+            "command": "remember", "status": "ok",
+            "summary": {"action": "created", "id": "753da84d-0000", "index_state": "pending"},
+            "items": [{"name": "write", "status": "ok", "value": "id=753da84d-0000"}],
+            "details": null,
+        }))
+        .expect("remember payload");
+        assert_eq!(out["id"], "753da84d-0000");
+        assert_eq!(out["action"], "created");
+        assert_eq!(out["write"], "id=753da84d-0000");
+    }
+
+    #[test]
+    fn update_bare_entry_details_stay_readable_alongside_action() {
+        let out = normalize_cli_payload(json!({
+            "command": "update", "status": "ok",
+            "summary": {"action": "written", "id": "753da84d-0000"},
+            "items": [{"name": "entry", "status": "ok", "value": "753da84d 改过的标题"}],
+            "details": {"id": "753da84d-0000", "content": "probe", "title": "改过的标题"},
+        }))
+        .expect("update payload");
+        assert_eq!(out["content"], "probe");
+        assert_eq!(out["action"], "written");
+    }
+
+    #[test]
+    fn typed_summary_values_survive_item_rows() {
+        // agent-config 的 items 值是字符串；summary 的布尔与数字才是权威类型。
+        let out = normalize_cli_payload(json!({
+            "command": "agent-config", "status": "ok",
+            "summary": {"memory_off": false, "purge_days": 30, "readonly": false},
+            "items": [{"name": "readonly", "status": "ok", "value": "false"},
+                      {"name": "purge_days", "status": "ok", "value": "30"}],
+            "details": null,
+        }))
+        .expect("agent-config payload");
+        assert_eq!(out["readonly"], json!(false));
+        assert_eq!(out["purge_days"], json!(30));
+    }
+
+    #[test]
+    fn item_values_fill_keys_summary_does_not_set() {
+        // space invite 的邀请码只出现在 items 里，UI 直接读 code。
+        let out = normalize_cli_payload(json!({
+            "command": "space", "status": "ok",
+            "summary": {"action": "invite", "space": "main"},
+            "items": [{"name": "code", "status": "ok", "value": "RSRS1.ABC"},
+                      {"name": "session", "status": "ok", "value": "sess-1"}],
+            "details": null,
+        }))
+        .expect("invite payload");
+        assert_eq!(out["code"], "RSRS1.ABC");
+        assert_eq!(out["session"], "sess-1");
+        assert_eq!(out["action"], "invite");
+    }
+
+    #[test]
+    fn fail_envelope_without_errors_still_names_the_missing_entry() {
+        // 实测 show 不存在的 id：退出码 1、stderr 空、errors 为空，只在 items 里。
+        let err = normalize_cli_payload(json!({
+            "command": "show", "status": "fail",
+            "summary": {"id": "no-such-id"},
+            "items": [{"name": "entry", "status": "fail", "value": "not found"}],
+            "errors": [],
+            "details": null,
+        }))
+        .expect_err("show must fail");
+        assert_eq!(err, "not found");
+    }
+
+    #[test]
+    fn multiline_usage_error_is_reduced_to_its_first_line() {
+        let message = envelope_message(&json!({
+            "command": "cli", "status": "fail",
+            "errors": ["error: unrecognized subcommand 'x'\n\n  tip: ...\n\nUsage: rsrs ..."],
+        }))
+        .expect("message");
+        assert_eq!(message, "error: unrecognized subcommand 'x'");
+    }
+
+    #[test]
+    fn doctor_failures_are_a_report_not_an_error() {
+        // doctor 有项不通过时退出码非零，但报告本身就是要展示的结果。
+        let out = normalize_cli_payload(json!({
+            "command": "doctor", "status": "fail",
+            "summary": {"pass": 13, "warn": 1, "fail": 1, "total": 15, "version": "1.0.16"},
+            "items": [{"name": "store", "status": "ok", "value": "/home/u/.rsrs"},
+                      {"name": "model", "status": "fail", "value": "missing"}],
+            "details": null,
+        }))
+        .expect("doctor report");
+        assert_eq!(out["fail"], 1);
+        assert_eq!(out["items"].as_array().expect("items").len(), 2);
+    }
+
+    #[test]
+    fn bare_arrays_and_objects_from_older_shells_pass_through() {
+        let rows = json!([{"id": "a"}]);
+        assert_eq!(normalize_cli_payload(rows.clone()).expect("array"), rows);
+        let plain = json!({"changed": true, "target": "codex"});
+        assert_eq!(normalize_cli_payload(plain.clone()).expect("object"), plain);
+    }
 }

@@ -62,3 +62,9 @@
 .tw-config-note{margin:0;font-size:11.5px;line-height:1.65;color:#8b8598}
 .tw-config-note a{color:#6b5bbd}
 .tw-key-warn{font-size:11.5px;color:#c47a2b;line-height:1.5}
+
+/* search result attribution */
+.tw-result-meta{display:flex;gap:8px;align-items:center;margin-top:4px;font-size:11px;line-height:1.4;color:var(--muted)}
+.tw-score{white-space:nowrap}
+.tw-superseded{padding:1px 6px;border-radius:6px;background:#f0b42926;color:#a5761b;font-weight:500;white-space:nowrap}
+[data-theme="dark"] .tw-superseded{background:#f0b42933;color:#e6b455}
